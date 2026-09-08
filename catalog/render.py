@@ -10,6 +10,7 @@ from pathlib import Path
 import pymupdf
 from PIL import Image
 
+from catalog.fonts import SEGOE_BOLD, SEGOE_REG, ensure_segoe_fonts
 from catalog.parse_price import Product, ProductLine
 
 PAGE_W, PAGE_H = 595.27557, 841.88977
@@ -23,13 +24,13 @@ ROW_GAP = 7.1
 SLOTS_PER_COL = 4
 
 STROKE = (0.82, 0.79, 0.75)
-LABEL = (0.62, 0.60, 0.58)
-INK = (0.11, 0.10, 0.09)
+LABEL = (158 / 255, 153 / 255, 148 / 255)  # #9e9994
+INK = (28 / 255, 26 / 255, 23 / 255)  # #1c1a17
 ORANGE = (1.0, 0.4, 0.0)
 WHITE = (1, 1, 1)
 
-FONT_REG = "/usr/share/fonts/truetype/macos/Inter-Regular.ttf"
-FONT_BOLD = "/usr/share/fonts/truetype/macos/Inter-Bold.ttf"
+FONT_REG = str(SEGOE_REG)
+FONT_BOLD = str(SEGOE_BOLD)
 
 ALREADY_IN_CATALOG = {
     "CA550",
@@ -156,10 +157,10 @@ def _card_rect(col: int, row: int, slots: int) -> pymupdf.Rect:
 
 
 def _wrap(font: pymupdf.Font, text: str, size: float, max_w: float) -> list[str]:
-    words = text.split()
+    tokens = re.findall(r"\([^()]*(?:\([^()]*\)[^()]*)*\)|\S+", text) or [text]
     lines: list[str] = []
     cur = ""
-    for w in words:
+    for w in tokens:
         trial = (cur + " " + w).strip()
         if font.text_length(trial, fontsize=size) <= max_w:
             cur = trial
@@ -167,6 +168,17 @@ def _wrap(font: pymupdf.Font, text: str, size: float, max_w: float) -> list[str]
             if cur:
                 lines.append(cur)
             cur = w
+            if font.text_length(cur, fontsize=size) > max_w:
+                # still too long: split on spaces inside
+                bits = w.split()
+                cur = ""
+                for b in bits:
+                    trial = (cur + " " + b).strip()
+                    if cur and font.text_length(trial, fontsize=size) > max_w:
+                        lines.append(cur)
+                        cur = b
+                    else:
+                        cur = trial
     if cur:
         lines.append(cur)
     return lines or [text]
@@ -180,92 +192,218 @@ def _sort_variants(products: list[Product]) -> list[Product]:
     return sorted(products, key=key)
 
 
-def _strip_variable_bits(name: str) -> str:
-    s = name
-    s = re.sub(r"\(\s*М14;?\s*", "(", s)
-    s = re.sub(r"М14;?\s*", "", s)
-    s = re.sub(r"\d+(?:[.,]\d+)?\s*[xх]\s*\d+(?:[.,]\d+)?\s*мм", "", s, flags=re.I)
-    s = re.sub(r"\d+(?:[.,]\d+)?\s*мм", "", s, flags=re.I)
-    s = re.sub(r"\(\s*;?\s*\)", "", s)
-    s = re.sub(r"\s+", " ", s)
-    return s.strip(" ,;()")
+PACK_RE = re.compile(r"\s+\d+\s*/\s*\d+\s*$")
+SIZE_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?(?:\s*[xх]\s*\d+(?:[.,]\d+)?)?\s*мм)",
+    re.I,
+)
+THREAD_RE = re.compile(r"\b[МM]\s*14\b")
+GRIT_RE = re.compile(r"\bP\s*\d+\b", re.I)
+
+# v12 vertical labels: bbox x0 = 22.58 / 307.46, dir=(0,-1), size 5.2
+_LABEL_INSERT_X = (26.613, 311.493)
+_PAGE_NUM_POS = {
+    True: (556.14, 824.22),
+    False: (20.73, 824.22),
+}
+
+
+def _normalize_name(name: str) -> str:
+    s = (
+        name.replace("\u2010", "-")
+        .replace("\u2011", "-")
+        .replace("\u2013", "-")
+        .replace("\u2014", "-")
+        .replace("\uFD3E", "(")
+        .replace("\uFD3F", ")")
+    )
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\(\s*", "(", s)
+    s = re.sub(r"\s*\)", ")", s)
+    s = re.sub(r";\s*", "; ", s)
+    return s
+
+
+def _split_core_and_attrs(name: str) -> tuple[str, dict]:
+    s = PACK_RE.sub("", _normalize_name(name)).strip()
+    attrs: dict = {}
+    if THREAD_RE.search(s):
+        attrs["thread"] = "М14"
+        s = THREAD_RE.sub(" ", s)
+    sizes = SIZE_RE.findall(s)
+    if sizes:
+        attrs["sizes"] = tuple(
+            re.sub(r"\s*мм$", " мм", re.sub(r"\s+", " ", z.strip()), flags=re.I)
+            for z in sizes
+        )
+        s = SIZE_RE.sub(" ", s)
+    grit = GRIT_RE.findall(s)
+    if grit:
+        attrs["grit"] = tuple(g.replace(" ", "").upper() for g in grit)
+        s = GRIT_RE.sub(" ", s)
+    for hard in ("жесткая", "мягкая"):
+        if re.search(hard, s, re.I):
+            attrs["hardness"] = hard
+            s = re.sub(hard, " ", s, flags=re.I)
+    s = re.sub(r"[\(\);,]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" ,;")
+    return s, attrs
+
+
+def _inject_bit(title: str, bit: str) -> str:
+    if bit in title:
+        return title
+    if "для УШМ" in title:
+        return title.replace("для УШМ", f"для УШМ, {bit},", 1)
+    if "для дрели" in title:
+        return title.replace("для дрели", f"для дрели, {bit},", 1)
+    return f"{title}, {bit}"
+
+
+def _tidy_title(title: str) -> str:
+    title = re.sub(r"\s+,", ",", title)
+    title = re.sub(r",\s*,", ",", title)
+    title = re.sub(r"\s+", " ", title)
+    return title.strip(" ,;")
 
 
 def _common_title(products: list[Product]) -> str:
     if len(products) <= 1:
         return ""
-    stripped = [_strip_variable_bits(p.name) for p in products]
-    words = [s.split() for s in stripped]
+    cores_attrs = [_split_core_and_attrs(p.name) for p in products]
+    cores = [c for c, _ in cores_attrs]
+    word_lists = [c.split() for c in cores]
     prefix: list[str] = []
-    for toks in zip(*words):
+    for toks in zip(*word_lists):
         if len({t.lower() for t in toks}) == 1:
             prefix.append(toks[0])
         else:
             break
     title = " ".join(prefix).strip(" ,;")
-    title = re.sub(r"\s+", " ", title)
     if len(title) < 12:
-        title = max(stripped, key=len)
-    return title
+        title = min(cores, key=len)
+
+    all_attrs = [a for _, a in cores_attrs]
+    shared_bits: list[str] = []
+    for key in ("thread", "sizes", "hardness", "grit"):
+        vals = [a.get(key) for a in all_attrs]
+        if not vals or any(v is None for v in vals):
+            continue
+        if key == "sizes":
+            present = list(vals)
+            if len({len(v) for v in present}) == 1:
+                n = len(present[0])
+                for i in range(n):
+                    col = {v[i] for v in present}
+                    if len(col) == 1:
+                        shared_bits.append(next(iter(col)))
+            elif len(set(present)) == 1:
+                shared_bits.extend(present[0])
+            continue
+        if len(set(vals)) != 1:
+            continue
+        shared = vals[0]
+        if key == "grit":
+            shared_bits.extend(shared)
+        else:
+            shared_bits.append(shared)
+    extra = [b for b in shared_bits if b not in title]
+    ushm_bits = [b for b in extra if b == "М14" or re.search(r"мм", b, re.I)]
+    other = [b for b in extra if b not in ushm_bits]
+    if ushm_bits:
+        title = _inject_bit(title, ", ".join(ushm_bits))
+    if other:
+        title = f"{title}, {', '.join(other)}"
+    return _tidy_title(title)
 
 
 def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
     if len(siblings) == 1:
-        return p.name
-    sizes = re.findall(r"(\d+(?:[.,]\d+)?)\s*мм", p.name, flags=re.I)
-    grit = re.search(r"(?:^|[\s,;(])(?:Р|P)(\d+)\b", p.name)
+        return _normalize_name(p.name)
+    all_attrs = [_split_core_and_attrs(s.name)[1] for s in siblings]
+    mine = _split_core_and_attrs(p.name)[1]
     bits: list[str] = []
-    if "М14" in p.name and "М14" not in (title or ""):
-        bits.append("М14")
-    if sizes:
-        bits.append(f"{sizes[-1]} мм")
-    if grit:
-        bits.append("P" + grit.group(1))
-    return ", ".join(bits) if bits else p.name
 
+    size_vals = [a.get("sizes") for a in all_attrs]
+    if len(set(size_vals)) > 1:
+        mine_sizes = mine.get("sizes") or ()
+        present = [v for v in size_vals if v]
+        if present and len({len(v) for v in present}) == 1:
+            n = len(present[0])
+            varying = [
+                i
+                for i in range(n)
+                if len({v[i] for v in present}) > 1
+            ]
+            if varying:
+                bits.extend(mine_sizes[i] for i in varying if i < len(mine_sizes))
+            else:
+                bits.extend(mine_sizes)
+        else:
+            bits.extend(mine_sizes)
 
-def _stamp_band(page: pymupdf.Page, src_page: pymupdf.Page, clip: pymupdf.Rect):
-    pix = src_page.get_pixmap(matrix=pymupdf.Matrix(3, 3), clip=clip, alpha=False)
-    page.insert_image(clip, pixmap=pix)
+    for key in ("thread", "hardness"):
+        vals = [a.get(key) for a in all_attrs]
+        if len(set(vals)) > 1 and mine.get(key):
+            bits.append(mine[key])
+    grit_vals = [a.get("grit") for a in all_attrs]
+    if len(set(grit_vals)) > 1 and mine.get("grit"):
+        bits.extend(mine["grit"])
+
+    return ", ".join(bits) if bits else _normalize_name(p.name)
 
 
 def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: str):
-    tmpl = src[0 if odd else 1]
-    header = pymupdf.Rect(0, 0, PAGE_W, HEADER_H)
-    footer = pymupdf.Rect(0, FOOTER_Y, PAGE_W, PAGE_H)
-    _stamp_band(page, tmpl, header)
-    _stamp_band(page, tmpl, footer)
-
-    page.insert_font(fontname="interb", fontfile=FONT_BOLD)
+    """Vector-copy v12 header/footer; wipe only the product band, keep chrome."""
+    tmpl = 0 if odd else 1
+    tmp = pymupdf.open()
+    tmp.insert_pdf(src, from_page=tmpl, to_page=tmpl)
+    # Inset so the header line at 90.7 and footer at 796.5 stay untouched.
+    tmp[0].add_redact_annot(pymupdf.Rect(0, 92.0, PAGE_W, 795.5), fill=WHITE)
     if odd:
-        box = pymupdf.Rect(507.4, FOOTER_Y, PAGE_W, PAGE_H)
+        tmp[0].add_redact_annot(pymupdf.Rect(554.0, 809.5, 577.0, 829.5), fill=ORANGE)
     else:
-        box = pymupdf.Rect(0, FOOTER_Y, 87.9, PAGE_H)
-    page.draw_rect(box, color=ORANGE, fill=ORANGE, width=0)
-    page.insert_textbox(
-        box + (0, 8, 0, -6),
+        tmp[0].add_redact_annot(pymupdf.Rect(18.5, 809.5, 41.5, 829.5), fill=ORANGE)
+    tmp[0].apply_redactions(images=0)
+    page.show_pdf_page(page.rect, tmp, 0)
+    tmp.close()
+    page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    x, y = _PAGE_NUM_POS[odd]
+    # Cover the template digits only — keep the diagonal orange number block.
+    if odd:
+        page.draw_rect(
+            pymupdf.Rect(554.0, 809.5, 577.0, 829.5),
+            color=ORANGE,
+            fill=ORANGE,
+            width=0,
+        )
+    else:
+        page.draw_rect(
+            pymupdf.Rect(18.5, 809.5, 41.5, 829.5),
+            color=ORANGE,
+            fill=ORANGE,
+            width=0,
+        )
+    page.insert_text(
+        (x, y),
         number,
-        fontname="interb",
+        fontname="segoeb",
         fontsize=16,
         color=WHITE,
-        align=pymupdf.TEXT_ALIGN_CENTER,
     )
 
 
 def _draw_category_label(
     page: pymupdf.Page, col: int, y0: float, y1: float, text: str
 ):
-    page.insert_font(fontname="inter", fontfile=FONT_REG)
-    x = 22.6 if col == 0 else 307.5
+    page.insert_font(fontname="segoe", fontfile=FONT_REG)
     font = pymupdf.Font(fontfile=FONT_REG)
     size = 5.2
     tw = font.text_length(text, fontsize=size)
-    mid = (y0 + y1) / 2
-    # rotate 90° CCW: text runs upward
     page.insert_text(
-        (x + size, mid + tw / 2),
+        (_LABEL_INSERT_X[col], (y0 + y1) / 2 + tw / 2),
         text,
-        fontname="inter",
+        fontname="segoe",
         fontsize=size,
         color=LABEL,
         rotate=90,
@@ -278,7 +416,7 @@ def draw_card(
     image_png: bytes | None,
     font_r: pymupdf.Font,
 ):
-    page.insert_font(fontname="inter", fontfile=FONT_REG)
+    page.insert_font(fontname="segoe", fontfile=FONT_REG)
     rect = _card_rect(placed.col, placed.row, placed.slots)
     page.draw_rect(rect, color=STROKE, fill=WHITE, width=0.65, radius=0.025)
 
@@ -290,18 +428,18 @@ def draw_card(
     name_w = sku_r - max_sku_w - 10 - name_x
 
     title = _common_title(products)
-    row_h = 12.8
+    row_h = 13.5
     title_lines = (
-        _wrap(font_r, title, 6.4, rect.width - 18)[:2] if title else []
+        _wrap(font_r, title, 7.2, rect.width - 18)[:2] if title else []
     )
-    title_h = 11.0 * len(title_lines)
+    title_h = row_h * len(title_lines)
     wraps = [
         _wrap(
             font_r,
             _variant_label(p, products, title),
             7.2,
             max(40, name_w),
-        )[: (1 if title else 2)]
+        )[: (1 if title else 3)]
         for p in products
     ]
     text_h = title_h + sum(max(1, len(w)) * row_h for w in wraps)
@@ -325,19 +463,19 @@ def draw_card(
     y = text_top
     for tl in title_lines:
         page.insert_text(
-            (name_x, y + 6.4),
+            (name_x, y + 7.2),
             tl,
-            fontname="inter",
-            fontsize=6.4,
-            color=LABEL,
+            fontname="segoe",
+            fontsize=7.2,
+            color=INK,
         )
-        y += 11.0
+        y += row_h
     for p, lines in zip(products, wraps):
         for i, ln in enumerate(lines):
             page.insert_text(
-                (name_x, y + 7.0),
+                (name_x, y + 7.2),
                 ln,
-                fontname="inter",
+                fontname="segoe",
                 fontsize=7.2,
                 color=INK,
             )
@@ -345,16 +483,16 @@ def draw_card(
                 sku_w = font_r.text_length(p.sku, fontsize=7.2)
                 price_w = font_r.text_length(p.price, fontsize=7.2)
                 page.insert_text(
-                    (sku_r - sku_w, y + 7.0),
+                    (sku_r - sku_w, y + 7.2),
                     p.sku,
-                    fontname="inter",
+                    fontname="segoe",
                     fontsize=7.2,
                     color=INK,
                 )
                 page.insert_text(
-                    (price_r - price_w, y + 7.0),
+                    (price_r - price_w, y + 7.2),
                     p.price,
-                    fontname="inter",
+                    fontname="segoe",
                     fontsize=7.2,
                     color=INK,
                 )
@@ -368,6 +506,7 @@ def render_new_pages(
     out_path: Path,
     n_new: int = 2,
 ) -> list[list[Placed]]:
+    ensure_segoe_fonts()
     src = pymupdf.open(catalog_src)
     price = pymupdf.open(price_src)
     out = pymupdf.open()

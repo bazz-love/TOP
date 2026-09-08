@@ -22,6 +22,7 @@ def clean_name(name: str, sku: str = "") -> str:
     name = re.sub(r"(?:«РОСОМАХА»\s*)+", "«РОСОМАХА» ", name)
     name = re.sub(r"\s*TOLSEN\s+\d{4,5}\s*$", " TOLSEN", name)
     name = re.sub(r"ммTOLSEN", "мм TOLSEN", name)
+    name = re.sub(r",(?=\S)", ", ", name)
     name = re.sub(r"\s+", " ", name).strip(" ,.")
     return name
 
