@@ -11,6 +11,16 @@ import pymupdf
 CAT_RE = re.compile(r"^(\d{2}\.\d{2}(?:\.\d)?)\s+(.+)$")
 PRICE_RE = re.compile(r"^(\d{1,3}(?: \d{3})*,\d{2})$")
 SKU_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-/\.]{1,24}$")
+# 1C often types Latin SKU suffixes with Cyrillic lookalikes (А/В/С…).
+_SKU_CYR_TO_LAT = str.maketrans(
+    "АВЕКМНОРСТХавекмнорстх",
+    "ABEKMHOPCTXabekmhopctx",
+)
+
+
+def latinize_sku(text: str) -> str:
+    return text.translate(_SKU_CYR_TO_LAT)
+
 
 # Card geometry — keep in sync with catalog.render
 _CELL_H = 167.6
@@ -178,7 +188,7 @@ def parse_price(pdf_path: str | Path) -> list[ProductLine]:
                 for t in row
                 if t["x"] > 430
                 and t["x"] < 530
-                and SKU_RE.match(t["text"])
+                and SKU_RE.match(latinize_sku(t["text"]))
                 and t["text"] != "12345"
             ]
             name_items = [
@@ -189,7 +199,10 @@ def parse_price(pdf_path: str | Path) -> list[ProductLine]:
 
             # SKU glued to the end of a long name
             if not sku_items and name_items:
-                m = re.search(r"\s([A-Za-z0-9][A-Za-z0-9\-/\.]{2,20})$", name_items[0]["text"])
+                m = re.search(
+                    r"\s([A-Za-z0-9АВЕКМНОРСТХавекмнорстх][A-Za-z0-9АВЕКМНОРСТХавекмнорстх\-/\.]{2,20})$",
+                    name_items[0]["text"],
+                )
                 if m and price_items:
                     sku_items = [{"text": m.group(1), "x": 488, "y": name_items[0]["y"]}]
                     name_items[0]["text"] = name_items[0]["text"][: m.start()].strip()
@@ -220,7 +233,7 @@ def parse_price(pdf_path: str | Path) -> list[ProductLine]:
 
             if price_items and (sku_items or name_items or pending_name):
                 name_parts = pending_name + [t["text"] for t in name_items]
-                sku = sku_items[0]["text"] if sku_items else ""
+                sku = latinize_sku(sku_items[0]["text"]) if sku_items else ""
                 price = price_items[0]["text"]
                 name = clean_name(" ".join(name_parts), sku)
                 if current is None:
