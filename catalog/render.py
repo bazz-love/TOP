@@ -32,26 +32,10 @@ WHITE = (1, 1, 1)
 FONT_REG = str(SEGOE_REG)
 FONT_BOLD = str(SEGOE_BOLD)
 
-ALREADY_IN_CATALOG = {
-    "CA550",
-    "CA520",
-    "AG30-190",
-    "GA220",
-    "40236",
-    "55263",
-    "40238",
-    "40221",
-    "40234",
-    "40240",
-    "40318",
-    "52227",
-    "40032",
-    "40601",
-    "55276",
-    "55277",
-    "40216",
-    "40159",
-}
+# v12 category strips left of each column
+STRIP_X = ((19.84, 30.47), (304.72, 315.35))
+STRIP_FILL = (0.965, 0.965, 0.968)
+STRIP_STROKE = (0.90, 0.90, 0.92)
 
 
 @dataclass
@@ -63,14 +47,7 @@ class Placed:
 
 
 def remaining_lines(lines: list[ProductLine]) -> list[ProductLine]:
-    out = []
-    for ln in lines:
-        if all(p.sku in ALREADY_IN_CATALOG for p in ln.products):
-            continue
-        if ln.category_code.startswith("01"):
-            continue
-        out.append(ln)
-    return out
+    return list(lines)
 
 
 def place_pages(lines: list[ProductLine], n_pages: int) -> list[list[Placed]]:
@@ -282,38 +259,6 @@ def _common_title(products: list[Product]) -> str:
     title = " ".join(prefix).strip(" ,;")
     if len(title) < 12:
         title = min(cores, key=len)
-
-    all_attrs = [a for _, a in cores_attrs]
-    shared_bits: list[str] = []
-    for key in ("thread", "sizes", "hardness", "grit"):
-        vals = [a.get(key) for a in all_attrs]
-        if not vals or any(v is None for v in vals):
-            continue
-        if key == "sizes":
-            present = list(vals)
-            if len({len(v) for v in present}) == 1:
-                n = len(present[0])
-                for i in range(n):
-                    col = {v[i] for v in present}
-                    if len(col) == 1:
-                        shared_bits.append(next(iter(col)))
-            elif len(set(present)) == 1:
-                shared_bits.extend(present[0])
-            continue
-        if len(set(vals)) != 1:
-            continue
-        shared = vals[0]
-        if key == "grit":
-            shared_bits.extend(shared)
-        else:
-            shared_bits.append(shared)
-    extra = [b for b in shared_bits if b not in title]
-    ushm_bits = [b for b in extra if b == "М14" or re.search(r"мм", b, re.I)]
-    other = [b for b in extra if b not in ushm_bits]
-    if ushm_bits:
-        title = _inject_bit(title, ", ".join(ushm_bits))
-    if other:
-        title = f"{title}, {', '.join(other)}"
     return _tidy_title(title)
 
 
@@ -393,9 +338,73 @@ def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: 
     )
 
 
+def _place_image(page: pymupdf.Page, image_png: bytes | None, dest: pymupdf.Rect):
+    if not image_png or dest.width < 8 or dest.height < 8:
+        return
+    pix = pymupdf.Pixmap(image_png)
+    iw, ih = pix.width, pix.height
+    if not iw or not ih:
+        return
+    scale = min(dest.width / iw, dest.height / ih)
+    dw, dh = iw * scale, ih * scale
+    box = pymupdf.Rect(
+        dest.x0 + (dest.width - dw) / 2,
+        dest.y0 + (dest.height - dh) / 2,
+        dest.x0 + (dest.width - dw) / 2 + dw,
+        dest.y0 + (dest.height - dh) / 2 + dh,
+    )
+    page.insert_image(box, pixmap=pix)
+
+
+def _draw_text_row(
+    page: pymupdf.Page,
+    font_r: pymupdf.Font,
+    y: float,
+    name_x: float,
+    sku_r: float,
+    price_r: float,
+    name: str,
+    sku: str | None,
+    price: str | None,
+):
+    page.insert_text(
+        (name_x, y + 7.2),
+        name,
+        fontname="segoe",
+        fontsize=7.2,
+        color=INK,
+    )
+    if sku:
+        sku_w = font_r.text_length(sku, fontsize=7.2)
+        page.insert_text(
+            (sku_r - sku_w, y + 7.2),
+            sku,
+            fontname="segoe",
+            fontsize=7.2,
+            color=INK,
+        )
+    if price:
+        price_w = font_r.text_length(price, fontsize=7.2)
+        page.insert_text(
+            (price_r - price_w, y + 7.2),
+            price,
+            fontname="segoe",
+            fontsize=7.2,
+            color=INK,
+        )
+
+
 def _draw_category_label(
     page: pymupdf.Page, col: int, y0: float, y1: float, text: str
 ):
+    x0, x1 = STRIP_X[col]
+    page.draw_rect(
+        pymupdf.Rect(x0, y0, x1, y1),
+        color=STRIP_STROKE,
+        fill=STRIP_FILL,
+        width=0.35,
+        radius=0.09,
+    )
     page.insert_font(fontname="segoe", fontfile=FONT_REG)
     font = pymupdf.Font(fontfile=FONT_REG)
     size = 5.2
@@ -420,47 +429,47 @@ def draw_card(
     rect = _card_rect(placed.col, placed.row, placed.slots)
     page.draw_rect(rect, color=STROKE, fill=WHITE, width=0.65, radius=0.025)
 
-    products = _sort_variants(placed.line.products)
+    products = list(placed.line.products)
+    n = len(products)
+    if n >= 3:
+        products = _sort_variants(products)
     name_x = rect.x0 + 7.0
     price_r = rect.x1 - 7.0
     sku_r = rect.x0 + 205.6
-    max_sku_w = max(font_r.text_length(p.sku, fontsize=7.2) for p in products)
-    name_w = sku_r - max_sku_w - 10 - name_x
+    row_h = 13.5
+    pad_bottom = 6.0
+
+    if n <= 2:
+        wraps = [
+            _wrap(font_r, _normalize_name(p.name), 7.2, max(40, sku_r - name_x - 36))[:3]
+            for p in products
+        ]
+        text_h = sum(max(1, len(w)) * row_h for w in wraps)
+        text_top = rect.y1 - pad_bottom - text_h
+        img_rect = pymupdf.Rect(rect.x0 + 10, rect.y0 + 8, rect.x1 - 10, text_top - 4)
+        _place_image(page, image_png, img_rect)
+        y = text_top
+        for p, lines in zip(products, wraps):
+            for i, ln in enumerate(lines):
+                _draw_text_row(
+                    page,
+                    font_r,
+                    y,
+                    name_x,
+                    sku_r,
+                    price_r,
+                    ln,
+                    p.sku if i == 0 else None,
+                    p.price if i == 0 else None,
+                )
+                y += row_h
+        return
 
     title = _common_title(products)
-    row_h = 13.5
-    title_lines = (
-        _wrap(font_r, title, 7.2, rect.width - 18)[:2] if title else []
-    )
+    title_lines = _wrap(font_r, title, 7.2, rect.width - 16)[:2] if title else []
     title_h = row_h * len(title_lines)
-    wraps = [
-        _wrap(
-            font_r,
-            _variant_label(p, products, title),
-            7.2,
-            max(40, name_w),
-        )[: (1 if title else 3)]
-        for p in products
-    ]
-    text_h = title_h + sum(max(1, len(w)) * row_h for w in wraps)
-    text_top = rect.y1 - 8 - text_h
-
-    img_rect = pymupdf.Rect(rect.x0 + 10, rect.y0 + 8, rect.x1 - 10, text_top - 4)
-    if image_png and img_rect.height > 20:
-        pix = pymupdf.Pixmap(image_png)
-        iw, ih = pix.width, pix.height
-        if iw and ih:
-            scale = min(img_rect.width / iw, img_rect.height / ih)
-            dw, dh = iw * scale, ih * scale
-            dest = pymupdf.Rect(
-                img_rect.x0 + (img_rect.width - dw) / 2,
-                img_rect.y0 + (img_rect.height - dh) / 2,
-                img_rect.x0 + (img_rect.width - dw) / 2 + dw,
-                img_rect.y0 + (img_rect.height - dh) / 2 + dh,
-            )
-            page.insert_image(dest, pixmap=pix)
-
-    y = text_top
+    title_top = rect.y0 + 8
+    y = title_top
     for tl in title_lines:
         page.insert_text(
             (name_x, y + 7.2),
@@ -470,33 +479,43 @@ def draw_card(
             color=INK,
         )
         y += row_h
-    for p, lines in zip(products, wraps):
-        for i, ln in enumerate(lines):
-            page.insert_text(
-                (name_x, y + 7.2),
-                ln,
-                fontname="segoe",
-                fontsize=7.2,
-                color=INK,
+    free = pymupdf.Rect(rect.x0 + 6, y + 2, rect.x1 - 6, rect.y1 - pad_bottom)
+
+    labels = [_variant_label(p, products, title) for p in products]
+
+    if n <= 7:
+        mid = (free.x0 + free.x1) / 2
+        img_rect = pymupdf.Rect(free.x0, free.y0, mid - 3, free.y1)
+        _place_image(page, image_png, img_rect)
+        var_x = mid + 2
+        max_sku_w = max(font_r.text_length(p.sku, fontsize=7.2) for p in products)
+        max_price_w = max(font_r.text_length(p.price, fontsize=7.2) for p in products)
+        var_price = free.x1
+        var_sku = var_price - max_price_w - 6
+        name_w = max(24, var_sku - max_sku_w - 6 - var_x)
+        avail = max(1, free.height)
+        vh = min(row_h, avail / max(1, n))
+        yv = free.y0 + max(0, (avail - n * vh) / 2)
+        for p, lab in zip(products, labels):
+            shown = _wrap(font_r, lab, 7.2, name_w)[0]
+            _draw_text_row(
+                page, font_r, yv, var_x, var_sku, var_price, shown, p.sku, p.price
             )
-            if i == 0:
-                sku_w = font_r.text_length(p.sku, fontsize=7.2)
-                price_w = font_r.text_length(p.price, fontsize=7.2)
-                page.insert_text(
-                    (sku_r - sku_w, y + 7.2),
-                    p.sku,
-                    fontname="segoe",
-                    fontsize=7.2,
-                    color=INK,
-                )
-                page.insert_text(
-                    (price_r - price_w, y + 7.2),
-                    p.price,
-                    fontname="segoe",
-                    fontsize=7.2,
-                    color=INK,
-                )
-            y += row_h
+            yv += vh
+        return
+
+    # 8+: title, medium image, then variant list
+    img_h = min(free.height * 0.42, 120)
+    img_rect = pymupdf.Rect(free.x0 + 20, free.y0, free.x1 - 20, free.y0 + img_h)
+    _place_image(page, image_png, img_rect)
+    list_top = img_rect.y1 + 4
+    avail = max(8, free.y1 - list_top)
+    vh = min(row_h, avail / max(1, n))
+    yv = list_top
+    for p, lab in zip(products, labels):
+        shown = _wrap(font_r, lab, 7.2, max(40, sku_r - name_x - 36))[0]
+        _draw_text_row(page, font_r, yv, name_x, sku_r, price_r, shown, p.sku, p.price)
+        yv += vh
 
 
 def render_new_pages(
@@ -504,19 +523,18 @@ def render_new_pages(
     price_src: Path,
     lines: list[ProductLine],
     out_path: Path,
-    n_new: int = 2,
+    n_new: int = 4,
 ) -> list[list[Placed]]:
     ensure_segoe_fonts()
     src = pymupdf.open(catalog_src)
     price = pymupdf.open(price_src)
     out = pymupdf.open()
-    out.insert_pdf(src)
 
     pages = place_pages(remaining_lines(lines), n_new)
     font_r = pymupdf.Font(fontfile=FONT_REG)
     img_cache: dict[tuple[int | None, int | None], bytes | None] = {}
 
-    start_num = src.page_count + 1
+    start_num = 1
     for i, placed_list in enumerate(pages):
         page_no = start_num + i
         odd = page_no % 2 == 1
