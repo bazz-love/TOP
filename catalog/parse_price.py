@@ -22,7 +22,8 @@ def clean_name(name: str, sku: str = "") -> str:
     name = re.sub(r"(?:«РОСОМАХА»\s*)+", "«РОСОМАХА» ", name)
     name = re.sub(r"\s*TOLSEN\s+\d{4,5}\s*$", " TOLSEN", name)
     name = re.sub(r"ммTOLSEN", "мм TOLSEN", name)
-    name = re.sub(r",(?=\S)", ", ", name)
+    # space after comma, but keep decimal commas: 0,5л / 22,23 мм
+    name = re.sub(r",(?!\d)(?=\S)", ", ", name)
     name = re.sub(r"\s+", " ", name).strip(" ,.")
     return name
 
@@ -49,7 +50,9 @@ class ProductLine:
     @property
     def slots(self) -> int:
         n = len(self.products)
-        return max(1, (n + 2) // 3)
+        if n <= 7:
+            return 1
+        return min(4, (n + 6) // 7)
 
 
 def _cluster_rows(items: list[dict], y_tol: float = 4.0) -> list[list[dict]]:
@@ -104,19 +107,14 @@ def parse_price(pdf_path: str | Path) -> list[ProductLine]:
         images.sort(key=lambda im: im["y0"])
 
         def image_at(y: float) -> int | None:
-            best = None
-            best_d = 1e9
-            for im in images:
-                if im["y0"] - 8 <= y <= im["y1"] + 12:
-                    d = abs(y - im["y0"])
-                    if d < best_d:
-                        best_d = d
-                        best = im["xref"]
-            if best is not None:
-                return best
-            # nearest above
-            above = [im for im in images if im["y0"] <= y]
-            return above[-1]["xref"] if above else None
+            # 1C groups align the photo top with the 12345 marker.
+            # Matching by overlap with slack stole the previous group's image.
+            if not images:
+                return None
+            best = min(images, key=lambda im: abs(im["y0"] - y))
+            if abs(best["y0"] - y) > 48:
+                return None
+            return best["xref"]
 
         rows = _cluster_rows(spans)
         for row in rows:

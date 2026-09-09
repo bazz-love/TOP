@@ -15,9 +15,9 @@ OUT = ROOT / "katalog_v13.pdf"
 def main() -> None:
     lines = parse_price(PRICE)
     rest = remaining_lines(lines)
-    pages = render_new_pages(SRC, PRICE, lines, OUT, n_new=2)
-    print(f"wrote {OUT}  (+{len(pages)} pages)")
-    for i, page in enumerate(pages, start=3):
+    pages = render_new_pages(SRC, PRICE, lines, OUT, n_new=4)
+    print(f"wrote {OUT}  ({len(pages)} pages)")
+    for i, page in enumerate(pages, start=1):
         print(f"  page {i:02d}")
         for pl in sorted(page, key=lambda p: (p.col, p.row)):
             skus = ", ".join(p.sku for p in pl.line.products)
