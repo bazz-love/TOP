@@ -427,6 +427,16 @@ def _place_image(page: pymupdf.Page, image_png: bytes | None, dest: pymupdf.Rect
 HEAD_SIZE = 5.4
 TITLE_SIZE = 8.0
 HEAD_INK = (0.52, 0.50, 0.48)
+# Wider than this (after trim) counts as a landscape photo.
+WIDE_ASPECT = 1.35
+
+
+def _image_aspect(image_png: bytes | None) -> float:
+    if not image_png:
+        return 1.0
+    with Image.open(io.BytesIO(image_png)) as im:
+        w, h = im.size
+    return (w / h) if h else 1.0
 
 
 def _draw_text_row(
@@ -470,11 +480,10 @@ def _draw_text_row(
 def _draw_col_headers(
     page: pymupdf.Page,
     font_r: pymupdf.Font,
-    font_b: pymupdf.Font,
     y: float,
     name_x: float,
-    sku_r: float,
-    price_r: float,
+    sku_left: float,
+    price_left: float,
 ):
     page.insert_text(
         (name_x, y + HEAD_SIZE),
@@ -483,17 +492,15 @@ def _draw_col_headers(
         fontsize=HEAD_SIZE,
         color=HEAD_INK,
     )
-    kod_w = font_r.text_length("код", fontsize=HEAD_SIZE)
     page.insert_text(
-        (sku_r - kod_w, y + HEAD_SIZE),
+        (sku_left, y + HEAD_SIZE),
         "код",
         fontname="segoe",
         fontsize=HEAD_SIZE,
         color=HEAD_INK,
     )
-    cena_w = font_r.text_length("цена", fontsize=HEAD_SIZE)
     page.insert_text(
-        (price_r - cena_w, y + HEAD_SIZE),
+        (price_left, y + HEAD_SIZE),
         "цена",
         fontname="segoe",
         fontsize=HEAD_SIZE,
@@ -534,11 +541,45 @@ def _draw_title_band(
 def _table_cols(font_r: pymupdf.Font, x0: float, x1: float, products: list[Product]):
     max_sku_w = max(font_r.text_length(p.sku, fontsize=7.2) for p in products)
     max_price_w = max(font_r.text_length(p.price, fontsize=7.2) for p in products)
+    sku_col_w = max(max_sku_w, font_r.text_length("код", fontsize=HEAD_SIZE))
+    price_col_w = max(max_price_w, font_r.text_length("цена", fontsize=HEAD_SIZE))
+    gap = 5.0
     price_r = x1
-    sku_r = price_r - max_price_w - 5
+    price_left = price_r - price_col_w
+    sku_r = price_left - gap
+    sku_left = sku_r - sku_col_w
     name_x = x0
-    name_w = max(24, sku_r - max_sku_w - 6 - name_x)
-    return name_x, sku_r, price_r, name_w
+    name_w = max(22, sku_left - gap - name_x)
+    return name_x, sku_r, price_r, name_w, sku_left, price_left
+
+
+def _draw_variant_table(
+    page: pymupdf.Page,
+    font_r: pymupdf.Font,
+    box: pymupdf.Rect,
+    products: list[Product],
+    labels: list[str],
+    row_h: float,
+    head_h: float,
+    *,
+    vcenter: bool,
+):
+    name_x, sku_r, price_r, name_w, sku_left, price_left = _table_cols(
+        font_r, box.x0, box.x1, products
+    )
+    n = max(1, len(products))
+    avail = max(1, box.height - head_h)
+    vh = min(row_h, avail / n)
+    block_h = head_h + n * vh
+    y = box.y0
+    if vcenter:
+        y += max(0, (box.height - block_h) / 2)
+    _draw_col_headers(page, font_r, y, name_x, sku_left, price_left)
+    y += head_h
+    for p, lab in zip(products, labels):
+        shown = _wrap(font_r, lab, 7.2, name_w)[0]
+        _draw_text_row(page, font_r, y, name_x, sku_r, price_r, shown, p.sku, p.price)
+        y += vh
 
 
 def draw_card(
@@ -561,55 +602,43 @@ def draw_card(
     labels = [_variant_label(p, products, title) for p in products]
     row_h = 13.0
     pad_bottom = 5.0
-    head_h = 10.0
+    head_h = 8.5
 
     below_title = _draw_title_band(page, font_b, rect, title)
     free = pymupdf.Rect(rect.x0 + 6, below_title, rect.x1 - 6, rect.y1 - pad_bottom)
 
-    if n <= 2:
-        table_h = head_h + n * row_h
-        img_rect = pymupdf.Rect(free.x0, free.y0, free.x1, max(free.y0 + 8, free.y1 - table_h - 3))
-        _place_image(page, image_png, img_rect)
-        name_x, sku_r, price_r, name_w = _table_cols(font_r, free.x0, free.x1, products)
-        y = free.y1 - table_h
-        _draw_col_headers(page, font_r, font_b, y, name_x, sku_r, price_r)
-        y += head_h
-        for p, lab in zip(products, labels):
-            shown = _wrap(font_r, lab, 7.2, name_w)[0]
-            _draw_text_row(page, font_r, y, name_x, sku_r, price_r, shown, p.sku, p.price)
-            y += row_h
-        return
+    wide = _image_aspect(image_png) >= WIDE_ASPECT
+    split = n <= 8 and not (n <= 2 and wide)
 
-    if n <= 7:
-        mid = (free.x0 + free.x1) / 2
+    if split:
+        mid = free.x0 + free.width * 0.48
         img_rect = pymupdf.Rect(free.x0, free.y0, mid - 3, free.y1)
         _place_image(page, image_png, img_rect)
-        name_x, sku_r, price_r, name_w = _table_cols(font_r, mid + 2, free.x1, products)
-        avail = max(1, free.height - head_h)
-        vh = min(row_h, avail / max(1, n))
-        y = free.y0
-        _draw_col_headers(page, font_r, font_b, y, name_x, sku_r, price_r)
-        y += head_h
-        y += max(0, (avail - n * vh) / 2)
-        for p, lab in zip(products, labels):
-            shown = _wrap(font_r, lab, 7.2, name_w)[0]
-            _draw_text_row(page, font_r, y, name_x, sku_r, price_r, shown, p.sku, p.price)
-            y += vh
+        table = pymupdf.Rect(mid + 2, free.y0, free.x1, free.y1)
+        _draw_variant_table(
+            page, font_r, table, products, labels, row_h, head_h, vcenter=True
+        )
         return
 
-    img_h = min(free.height * 0.38, 110)
-    img_rect = pymupdf.Rect(free.x0 + 16, free.y0, free.x1 - 16, free.y0 + img_h)
+    if n > 8:
+        img_h = min(free.height * 0.42, 130)
+        img_rect = pymupdf.Rect(free.x0 + 10, free.y0, free.x1 - 10, free.y0 + img_h)
+        _place_image(page, image_png, img_rect)
+        table = pymupdf.Rect(free.x0, img_rect.y1 + 3, free.x1, free.y1)
+        _draw_variant_table(
+            page, font_r, table, products, labels, row_h, head_h, vcenter=False
+        )
+        return
+
+    table_h = head_h + n * row_h
+    img_rect = pymupdf.Rect(
+        free.x0, free.y0, free.x1, max(free.y0 + 8, free.y1 - table_h - 3)
+    )
     _place_image(page, image_png, img_rect)
-    name_x, sku_r, price_r, name_w = _table_cols(font_r, free.x0, free.x1, products)
-    y = img_rect.y1 + 3
-    _draw_col_headers(page, font_r, font_b, y, name_x, sku_r, price_r)
-    y += head_h
-    avail = max(8, free.y1 - y)
-    vh = min(row_h, avail / max(1, n))
-    for p, lab in zip(products, labels):
-        shown = _wrap(font_r, lab, 7.2, name_w)[0]
-        _draw_text_row(page, font_r, y, name_x, sku_r, price_r, shown, p.sku, p.price)
-        y += vh
+    table = pymupdf.Rect(free.x0, free.y1 - table_h, free.x1, free.y1)
+    _draw_variant_table(
+        page, font_r, table, products, labels, row_h, head_h, vcenter=False
+    )
 
 
 def _draw_category_label(
