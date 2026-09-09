@@ -12,6 +12,42 @@ CAT_RE = re.compile(r"^(\d{2}\.\d{2}(?:\.\d)?)\s+(.+)$")
 PRICE_RE = re.compile(r"^(\d{1,3}(?: \d{3})*,\d{2})$")
 SKU_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-/\.]{1,24}$")
 
+# Card geometry — keep in sync with catalog.render
+_CELL_H = 167.6
+_ROW_GAP = 7.1
+_ROW_H = 13.0
+_HEAD_H = 8.5
+_TITLE_PAD = 28.0
+
+
+def stacked_slot_count(n: int, two_col: bool) -> int:
+    """How many 2×4 grid slots a stacked (n>8) card needs."""
+    if n <= 8:
+        return 1
+    rows = (n + 1) // 2 if two_col else n
+    table_h = _HEAD_H + rows * _ROW_H
+    min_img = 80.0 if two_col else 100.0
+    need = _TITLE_PAD + min_img + table_h
+    for k in range(1, 5):
+        if k * _CELL_H + (k - 1) * _ROW_GAP >= need:
+            return k
+    return 4
+
+
+def uses_two_col_table(n: int) -> bool:
+    """Two variant columns only when that shrinks the card (e.g. 3 slots → 2)."""
+    if n <= 8:
+        return False
+    return stacked_slot_count(n, True) < stacked_slot_count(n, False)
+
+
+def product_line_slots(n: int) -> int:
+    if n <= 8:
+        return 1
+    one = stacked_slot_count(n, False)
+    two = stacked_slot_count(n, True)
+    return two if two < one else one
+
 
 def clean_name(name: str, sku: str = "") -> str:
     name = name.replace("*СЛЕДОПЫТ", "«СЛЕДОПЫТ").replace('СЛЕДОПЫТ"', "СЛЕДОПЫТ»")
@@ -58,22 +94,7 @@ class ProductLine:
 
     @property
     def slots(self) -> int:
-        n = len(self.products)
-        if n <= 8:
-            return 1
-        # Card heights in render.py: 167.6 cell + 7.1 gap. Two-column
-        # tables (n>=20) need fewer rows, so Basic/ROSOMAHA fit in 2
-        # slots and Duo in 3 with a large photo above the list.
-        two_col = n >= 20
-        rows = (n + 1) // 2 if two_col else n
-        table_h = 8.5 + rows * 13.0
-        min_img = 80.0 if two_col else 100.0
-        need = 28.0 + min_img + table_h
-        cell, gap = 167.6, 7.1
-        for k in range(1, 5):
-            if k * cell + (k - 1) * gap >= need:
-                return k
-        return 4
+        return product_line_slots(len(self.products))
 
 
 def _cluster_rows(items: list[dict], y_tol: float = 4.0) -> list[list[dict]]:

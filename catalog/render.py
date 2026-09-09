@@ -11,7 +11,7 @@ import pymupdf
 from PIL import Image
 
 from catalog.fonts import SEGOE_BOLD, SEGOE_REG, ensure_segoe_fonts
-from catalog.parse_price import Product, ProductLine
+from catalog.parse_price import Product, ProductLine, uses_two_col_table
 
 PAGE_W, PAGE_H = 595.27557, 841.88977
 HEADER_H = 90.7
@@ -747,9 +747,9 @@ def _draw_variant_table(
     columns: int | None = None,
 ):
     n = max(1, len(products))
-    cols = 2 if (columns is None and n >= 20) else (columns or 1)
+    cols = 2 if (columns is None and uses_two_col_table(n)) else (columns or 1)
     if cols >= 2 and n >= 4:
-        gap = 7.0
+        gap = 8.0
         mid_n = (n + 1) // 2
         col_w = (box.width - gap) / 2
         left = pymupdf.Rect(box.x0, box.y0, box.x0 + col_w, box.y1)
@@ -775,6 +775,13 @@ def _draw_variant_table(
             head_h,
             vcenter=vcenter,
             columns=1,
+        )
+        x = box.x0 + col_w + gap / 2
+        page.draw_line(
+            pymupdf.Point(x, box.y0 + 1.0),
+            pymupdf.Point(x, box.y1 - 1.0),
+            color=(0.70, 0.68, 0.65),
+            width=0.5,
         )
         return
     name_x, sku_r, price_r, name_w, sku_left, price_left = _table_cols(
@@ -834,7 +841,7 @@ def draw_card(
         return
 
     if n > 8:
-        two_col = n >= 20
+        two_col = uses_two_col_table(n)
         if two_col:
             rows = (n + 1) // 2
             min_img = max(88.0, free.height * 0.38)
