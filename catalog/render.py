@@ -252,8 +252,9 @@ GRIT_RE = re.compile(
 ROWS_RE = re.compile(r"(\d+\s*ряд(?:а|ов)?)(?:\s+проволоки)?", re.I)
 BORE_RE = re.compile(r"^(?:22[,.](?:2[23]?|3)|25[,.]4)\s*мм$", re.I)
 SAW_DIA_TEETH_RE = re.compile(r"(\d+)\s+(\d+)\s*зуб\.?", re.I)
-ARBOR_RE = re.compile(r"\d+\s*/\s*\d+\s*мм", re.I)
+ARBOR_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*мм", re.I)
 TEETH_RE = re.compile(r"(\d+)\s*Т\b", re.I)
+SAW_NAME_RE = re.compile(r"пильн", re.I)
 
 # v12 vertical labels: bbox x0 = 22.58 / 307.46, dir=(0,-1), size 5.2
 _LABEL_INSERT_X = (26.613, 311.493)
@@ -309,20 +310,27 @@ def _split_core_and_attrs(name: str) -> tuple[str, dict]:
         attrs["sizes"] = attrs["sizes"] + (_norm_measure(saw.group(1) + " мм"),)
         attrs["teeth"] = (saw.group(2) + "Т",)
         s = SAW_DIA_TEETH_RE.sub(" ", s)
-    s = ARBOR_RE.sub(" ", s)
+    arb = ARBOR_RE.search(s)
+    if arb:
+        attrs["arbor"] = (f"{arb.group(1)}/{arb.group(2)}",)
+        s = ARBOR_RE.sub(" ", s)
     teeth = TEETH_RE.findall(s)
     if teeth:
         attrs["teeth"] = tuple(t + "Т" for t in teeth)
         s = TEETH_RE.sub(" ", s)
     found_sizes = SIZE_RE.findall(s)
     if found_sizes:
-        sizes = tuple(
-            z
-            for z in (_norm_measure(z) for z in found_sizes)
-            if not BORE_RE.match(z)
-        )
+        sizes = []
+        arbors = list(attrs.get("arbor") or ())
+        for z in (_norm_measure(z) for z in found_sizes):
+            if BORE_RE.match(z):
+                arbors.append(re.sub(r"\s*мм$", "", z, flags=re.I).replace(".", ","))
+            else:
+                sizes.append(z)
         if sizes:
-            attrs["sizes"] = attrs.get("sizes", ()) + sizes
+            attrs["sizes"] = attrs.get("sizes", ()) + tuple(sizes)
+        if arbors:
+            attrs["arbor"] = tuple(arbors)
         s = SIZE_RE.sub(" ", s)
     vols = VOL_RE.findall(s)
     if vols:
@@ -493,6 +501,18 @@ def _leftover_words(core: str, title: str) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _is_saw(name: str) -> bool:
+    return bool(SAW_NAME_RE.search(name))
+
+
+def _arbor_bits(attrs: dict) -> tuple[str, ...]:
+    raw = attrs.get("arbor") or ()
+    out = []
+    for a in raw if isinstance(raw, tuple) else (raw,):
+        out.append(re.sub(r"\s*мм$", "", str(a), flags=re.I).replace(".", ",").strip())
+    return tuple(out)
+
+
 def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
     mine_core, mine = _split_core_and_attrs_sku(p)
     if len(siblings) == 1:
@@ -506,6 +526,8 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
             bits.extend(grit if isinstance(grit, tuple) else [grit])
         if mine.get("hardness"):
             bits.append(mine["hardness"])
+        if _is_saw(p.name):
+            bits.extend(_arbor_bits(mine))
         if not bits and mine.get("thread"):
             bits.append(mine["thread"])
         return ", ".join(bits) if bits else "—"
@@ -522,6 +544,8 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
         if len(set(vals)) > 1 and mine.get(key):
             val = mine[key]
             bits.extend(val if isinstance(val, tuple) else [val])
+    if _is_saw(p.name):
+        bits.extend(_arbor_bits(mine))
     leftover = _leftover_words(mine_core, title)
     if leftover and len(set(leftovers)) > 1:
         common = set(leftovers[0])
@@ -652,12 +676,13 @@ def _draw_text_row(
     name: str,
     sku: str | None,
     price: str | None,
+    name_size: float = 7.2,
 ):
     page.insert_text(
         (name_x, y + 7.2),
         name,
         fontname="segoe",
-        fontsize=7.2,
+        fontsize=name_size,
         color=INK,
     )
     if sku:
@@ -819,8 +844,21 @@ def _draw_variant_table(
     _draw_col_headers(page, font_r, y, name_x, sku_left, price_left)
     y += head_h
     for p, lab in zip(products, labels):
-        shown = _wrap(font_r, lab, 7.2, name_w)[0]
-        _draw_text_row(page, font_r, y, name_x, sku_r, price_r, shown, p.sku, p.price)
+        name_size = 7.2
+        if _is_saw(p.name):
+            shown = lab
+            if font_r.text_length(lab, fontsize=name_size) > name_w:
+                name_size = max(
+                    6.2,
+                    name_size
+                    * name_w
+                    / max(1.0, font_r.text_length(lab, fontsize=name_size)),
+                )
+        else:
+            shown = _wrap(font_r, lab, 7.2, name_w)[0]
+        _draw_text_row(
+            page, font_r, y, name_x, sku_r, price_r, shown, p.sku, p.price, name_size
+        )
         y += vh
 
 
