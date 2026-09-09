@@ -18,6 +18,11 @@ def clean_name(name: str, sku: str = "") -> str:
     name = re.sub(r'"\s*Рос+омаха\s*"', "«РОСОМАХА»", name, flags=re.I)
     name = re.sub(r'"\s*БУЛЬДОЗЕР\s*"', "«БУЛЬДОЗЕР»", name, flags=re.I)
     name = name.replace("натурайльного", "натурального")
+    name = name.replace("керамогниту", "керамограниту")
+    name = name.replace("камню. кирпичу", "камню, кирпичу")
+    name = re.sub(r"SDS\s*(?:-?\s*plus|\+)", "SDS+", name, flags=re.I)
+    name = re.sub(r"(?<=[а-яёА-ЯЁ])\.(?=[а-яёА-ЯЁ])", ". ", name)
+    name = re.sub(r"(?<!\s)«", " «", name)
     name = re.sub(r"\s+", " ", name).strip()
     name = re.sub(r"^\d{4,5}\s+", "", name)
     if sku:
@@ -56,7 +61,19 @@ class ProductLine:
         n = len(self.products)
         if n <= 8:
             return 1
-        return min(4, (n + 6) // 7)
+        # Card heights in render.py: 167.6 cell + 7.1 gap. Two-column
+        # tables (n>=20) need fewer rows, so Basic/ROSOMAHA fit in 2
+        # slots and Duo in 3 with a large photo above the list.
+        two_col = n >= 20
+        rows = (n + 1) // 2 if two_col else n
+        table_h = 8.5 + rows * 13.0
+        min_img = 80.0 if two_col else 100.0
+        need = 28.0 + min_img + table_h
+        cell, gap = 167.6, 7.1
+        for k in range(1, 5):
+            if k * cell + (k - 1) * gap >= need:
+                return k
+        return 4
 
 
 def _cluster_rows(items: list[dict], y_tol: float = 4.0) -> list[list[dict]]:

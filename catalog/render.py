@@ -47,7 +47,32 @@ class Placed:
 
 
 def remaining_lines(lines: list[ProductLine]) -> list[ProductLine]:
-    return list(lines)
+    """Keep price order, except SDS burs: Basic, then 4-edge ROSOMAHA, then Duo."""
+    tagged: list[tuple[str | None, ProductLine]] = []
+    for ln in lines:
+        name = ln.products[0].name if ln.products else ""
+        kind = None
+        if "Rennbohr Basic" in name:
+            kind = "basic"
+        elif "Rennbohr Duo" in name:
+            kind = "duo"
+        elif "4 режущие грани" in name and ln.category_code.startswith("04.03"):
+            kind = "four"
+        tagged.append((kind, ln))
+    kinds = {k for k, _ in tagged if k}
+    if not {"basic", "duo", "four"} <= kinds:
+        return [ln for _, ln in tagged]
+    burs = {k: ln for k, ln in tagged if k}
+    out: list[ProductLine] = []
+    inserted = False
+    for k, ln in tagged:
+        if k:
+            if not inserted:
+                out.extend((burs["basic"], burs["four"], burs["duo"]))
+                inserted = True
+            continue
+        out.append(ln)
+    return out
 
 
 def place_pages(lines: list[ProductLine], n_pages: int) -> list[list[Placed]]:
@@ -171,7 +196,13 @@ def _sort_variants(products: list[Product]) -> list[Product]:
 
     def key(p: Product):
         _, attrs = _split_core_and_attrs(p.name)
-        return (nums(attrs.get("sizes")), nums(attrs.get("vol")), nums(attrs.get("grit")), p.sku)
+        return (
+            nums(attrs.get("sizes")),
+            nums(attrs.get("vol")),
+            nums(attrs.get("grit")),
+            nums(attrs.get("teeth")),
+            p.sku,
+        )
 
     return sorted(products, key=key)
 
@@ -198,6 +229,9 @@ GRIT_RE = re.compile(
 )
 ROWS_RE = re.compile(r"(\d+\s*ряд(?:а|ов)?)(?:\s+проволоки)?", re.I)
 BORE_RE = re.compile(r"^(?:22[,.](?:2[23]?|3)|25[,.]4)\s*мм$", re.I)
+SAW_DIA_TEETH_RE = re.compile(r"(\d+)\s+(\d+)\s*зуб\.?", re.I)
+ARBOR_RE = re.compile(r"\d+\s*/\s*\d+\s*мм", re.I)
+TEETH_RE = re.compile(r"(\d+)\s*Т\b", re.I)
 
 # v12 vertical labels: bbox x0 = 22.58 / 307.46, dir=(0,-1), size 5.2
 _LABEL_INSERT_X = (26.613, 311.493)
@@ -247,9 +281,26 @@ def _split_core_and_attrs(name: str) -> tuple[str, dict]:
     if THREAD_RE.search(s):
         attrs["thread"] = "М14"
         s = THREAD_RE.sub(" ", s)
-    sizes = SIZE_RE.findall(s)
-    if sizes:
-        attrs["sizes"] = tuple(_norm_measure(z) for z in sizes)
+    saw = SAW_DIA_TEETH_RE.search(s)
+    if saw:
+        attrs.setdefault("sizes", ())
+        attrs["sizes"] = attrs["sizes"] + (_norm_measure(saw.group(1) + " мм"),)
+        attrs["teeth"] = (saw.group(2) + "Т",)
+        s = SAW_DIA_TEETH_RE.sub(" ", s)
+    s = ARBOR_RE.sub(" ", s)
+    teeth = TEETH_RE.findall(s)
+    if teeth:
+        attrs["teeth"] = tuple(t + "Т" for t in teeth)
+        s = TEETH_RE.sub(" ", s)
+    found_sizes = SIZE_RE.findall(s)
+    if found_sizes:
+        sizes = tuple(
+            z
+            for z in (_norm_measure(z) for z in found_sizes)
+            if not BORE_RE.match(z)
+        )
+        if sizes:
+            attrs["sizes"] = attrs.get("sizes", ()) + sizes
         s = SIZE_RE.sub(" ", s)
     vols = VOL_RE.findall(s)
     if vols:
@@ -271,6 +322,7 @@ def _split_core_and_attrs(name: str) -> tuple[str, dict]:
     s = re.sub(r"/\s*уп\.?", " ", s, flags=re.I)
     s = re.sub(r"картонный\s+подвес", " ", s, flags=re.I)
     s = BOX_RE.sub(" ", s)
+    s = re.sub(r"\s*\*\s*", " ", s)
     s = re.sub(r"[\(\);,]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip(" ,;.")
     return s, attrs
@@ -283,6 +335,7 @@ def _tidy_title(title: str) -> str:
     title = re.sub(r"\s+", " ", title)
     title = title.strip(" ,;.×")
     title = re.sub(r"\s+(по|с|и|для|из)$", "", title, flags=re.I)
+    title = title.replace("камню кирпичу", "камню, кирпичу")
     if title and title[0].islower():
         title = title[0].upper() + title[1:]
     return title.strip(" ,;.")
@@ -342,6 +395,46 @@ def _strip_bore_in_size(size: str) -> str:
     return out
 
 
+def _size_parts_list(size: str) -> list[str]:
+    body = re.sub(r"\s*мм$", "", _strip_bore_in_size(size), flags=re.I)
+    return [p for p in body.split("×") if p]
+
+
+def _format_size_parts(parts: list[str]) -> str:
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        p = parts[0]
+        return p if re.search(r"мм", p, re.I) else f"{p} мм"
+    return "×".join(parts) + " мм"
+
+
+def _differing_size_label(mine_sizes: tuple[str, ...], size_vals: list) -> list[str]:
+    present = [v for v in size_vals if v]
+    if not mine_sizes or not present:
+        return []
+    if all(len(v) == 1 for v in present):
+        part_lists = [_size_parts_list(v[0]) for v in present]
+        counts = {len(p) for p in part_lists}
+        if len(counts) == 1 and part_lists[0]:
+            nparts = len(part_lists[0])
+            varying = [i for i in range(nparts) if len({pl[i] for pl in part_lists}) > 1]
+            mine_parts = _size_parts_list(mine_sizes[0])
+            shown = [mine_parts[i] for i in varying if i < len(mine_parts)]
+            if shown:
+                return [_format_size_parts(shown)]
+            return _type_sizes(mine_sizes)
+    if len({len(v) for v in present}) == 1:
+        n = len(present[0])
+        varying = [i for i in range(n) if len({v[i] for v in present}) > 1]
+        return [
+            _strip_bore_in_size(mine_sizes[i])
+            for i in varying
+            if i < len(mine_sizes)
+        ]
+    return _type_sizes(mine_sizes)
+
+
 def _type_sizes(sizes: tuple[str, ...] | None) -> list[str]:
     """Keep the product size; drop bore 22,23 мм and wire gauges under 2 мм."""
     if not sizes:
@@ -385,6 +478,7 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
         bits.extend(_type_sizes(mine.get("sizes")))
         bits.extend(mine.get("vol") or ())
         bits.extend(mine.get("rows") or ())
+        bits.extend(mine.get("teeth") or ())
         grit = mine.get("grit")
         if grit:
             bits.extend(grit if isinstance(grit, tuple) else [grit])
@@ -400,19 +494,8 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
     bits = []
     size_vals = [a.get("sizes") for a in all_attrs]
     if len(set(size_vals)) > 1:
-        mine_sizes = mine.get("sizes") or ()
-        present = [v for v in size_vals if v]
-        if present and len({len(v) for v in present}) == 1:
-            n = len(present[0])
-            varying = [i for i in range(n) if len({v[i] for v in present}) > 1]
-            bits.extend(
-                _strip_bore_in_size(mine_sizes[i])
-                for i in varying
-                if i < len(mine_sizes)
-            )
-        else:
-            bits.extend(_type_sizes(mine_sizes))
-    for key in ("vol", "thread", "hardness", "grit", "rows"):
+        bits.extend(_differing_size_label(mine.get("sizes") or (), size_vals))
+    for key in ("vol", "thread", "hardness", "grit", "rows", "teeth"):
         vals = [a.get(key) for a in all_attrs]
         if len(set(vals)) > 1 and mine.get(key):
             val = mine[key]
@@ -661,7 +744,39 @@ def _draw_variant_table(
     head_h: float,
     *,
     vcenter: bool,
+    columns: int | None = None,
 ):
+    n = max(1, len(products))
+    cols = 2 if (columns is None and n >= 20) else (columns or 1)
+    if cols >= 2 and n >= 4:
+        gap = 7.0
+        mid_n = (n + 1) // 2
+        col_w = (box.width - gap) / 2
+        left = pymupdf.Rect(box.x0, box.y0, box.x0 + col_w, box.y1)
+        right = pymupdf.Rect(box.x0 + col_w + gap, box.y0, box.x1, box.y1)
+        _draw_variant_table(
+            page,
+            font_r,
+            left,
+            products[:mid_n],
+            labels[:mid_n],
+            row_h,
+            head_h,
+            vcenter=vcenter,
+            columns=1,
+        )
+        _draw_variant_table(
+            page,
+            font_r,
+            right,
+            products[mid_n:],
+            labels[mid_n:],
+            row_h,
+            head_h,
+            vcenter=vcenter,
+            columns=1,
+        )
+        return
     name_x, sku_r, price_r, name_w, sku_left, price_left = _table_cols(
         font_r, box.x0, box.x1, products
     )
@@ -719,6 +834,27 @@ def draw_card(
         return
 
     if n > 8:
+        two_col = n >= 20
+        if two_col:
+            rows = (n + 1) // 2
+            min_img = max(88.0, free.height * 0.38)
+            table_h = min(head_h + rows * row_h, max(head_h + 9.0, free.height - min_img - 4))
+            img_h = max(48.0, free.height - table_h - 4)
+            img_rect = pymupdf.Rect(free.x0 + 8, free.y0, free.x1 - 8, free.y0 + img_h)
+            _place_image(page, image_png, img_rect)
+            table = pymupdf.Rect(free.x0, img_rect.y1 + 3, free.x1, free.y1)
+            _draw_variant_table(
+                page,
+                font_r,
+                table,
+                products,
+                labels,
+                row_h,
+                head_h,
+                vcenter=False,
+                columns=2,
+            )
+            return
         img_h = min(free.height * 0.42, 130)
         img_rect = pymupdf.Rect(free.x0 + 10, free.y0, free.x1 - 10, free.y0 + img_h)
         _place_image(page, image_png, img_rect)
