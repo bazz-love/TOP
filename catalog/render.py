@@ -75,10 +75,18 @@ def remaining_lines(lines: list[ProductLine]) -> list[ProductLine]:
     return out
 
 
+def _section(code: str) -> str:
+    return code.split(".", 1)[0]
+
+
 def place_pages(lines: list[ProductLine], n_pages: int) -> list[list[Placed]]:
+    """Column-major pack. If a tall block cannot use a leftover slot, pull the
+    next same-section item that fits (a single into a single hole) instead of
+    leaving a gap. Items never jump into a different section (03 vs 04)."""
     pages: list[list[Placed]] = []
     used = [0, 0]
     page: list[Placed] = []
+    queue = list(lines)
 
     def new_page():
         nonlocal used, page
@@ -87,30 +95,44 @@ def place_pages(lines: list[ProductLine], n_pages: int) -> list[list[Placed]]:
         page = []
         used = [0, 0]
 
-    for ln in lines:
-        if len(pages) >= n_pages:
-            break
+    def try_place(ln: ProductLine) -> bool:
         slots = min(ln.slots, SLOTS_PER_COL)
-        placed = False
-        while not placed:
-            if used[0] + slots <= SLOTS_PER_COL:
-                page.append(Placed(ln, 0, used[0], slots))
-                used[0] += slots
-                placed = True
-            elif used[1] + slots <= SLOTS_PER_COL:
-                page.append(Placed(ln, 1, used[1], slots))
-                used[1] += slots
-                placed = True
-            else:
+        if used[0] + slots <= SLOTS_PER_COL:
+            page.append(Placed(ln, 0, used[0], slots))
+            used[0] += slots
+            return True
+        if used[1] + slots <= SLOTS_PER_COL:
+            page.append(Placed(ln, 1, used[1], slots))
+            used[1] += slots
+            return True
+        return False
+
+    def pull_filler(blocked_at: int) -> bool:
+        if used[0] >= SLOTS_PER_COL and used[1] >= SLOTS_PER_COL:
+            return False
+        sec = _section(queue[blocked_at].category_code)
+        hole = [SLOTS_PER_COL - used[0], SLOTS_PER_COL - used[1]]
+        for j in range(blocked_at + 1, len(queue)):
+            other = queue[j]
+            if _section(other.category_code) != sec:
+                return False
+            if min(other.slots, SLOTS_PER_COL) <= max(hole):
+                queue.insert(blocked_at, queue.pop(j))
+                return True
+        return False
+
+    i = 0
+    while i < len(queue) and len(pages) < n_pages:
+        if try_place(queue[i]):
+            i += 1
+            if used[0] == SLOTS_PER_COL and used[1] == SLOTS_PER_COL:
                 new_page()
-                if len(pages) >= n_pages:
-                    break
-        if len(pages) >= n_pages and not placed:
+            continue
+        if pull_filler(i):
+            continue
+        if not page:
             break
-        if used[0] == SLOTS_PER_COL and used[1] == SLOTS_PER_COL:
-            new_page()
-            if len(pages) >= n_pages:
-                break
+        new_page()
 
     if page and len(pages) < n_pages:
         pages.append(page)
