@@ -18,6 +18,11 @@ def clean_name(name: str, sku: str = "") -> str:
     name = re.sub(r'"\s*Рос+омаха\s*"', "«РОСОМАХА»", name, flags=re.I)
     name = re.sub(r'"\s*БУЛЬДОЗЕР\s*"', "«БУЛЬДОЗЕР»", name, flags=re.I)
     name = name.replace("натурайльного", "натурального")
+    name = name.replace("керамогниту", "керамограниту")
+    name = name.replace("камню. кирпичу", "камню, кирпичу")
+    name = re.sub(r"SDS\s*(?:-?\s*plus|\+)", "SDS+", name, flags=re.I)
+    name = re.sub(r"(?<=[а-яёА-ЯЁ])\.(?=[а-яёА-ЯЁ])", ". ", name)
+    name = re.sub(r"(?<!\s)«", " «", name)
     name = re.sub(r"\s+", " ", name).strip()
     name = re.sub(r"^\d{4,5}\s+", "", name)
     if sku:
