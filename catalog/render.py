@@ -180,7 +180,11 @@ PACK_RE = re.compile(r"\s+\d+\s*/\s*\d+\s*$")
 PACK_COUNT_RE = re.compile(r"\d+\s*шт\.?(?:\s*[-–./]\s*\d+\s*уп\.?)?", re.I)
 BOX_RE = re.compile(r"(?:^|[\s,;.])кор\.?(?=$|[\s,;.])", re.I)
 SIZE_RE = re.compile(
-    r"(\d+(?:[.,]\d+)?(?:(?:\s*[-–]\s*|\s*[xх*]\s*)\d+(?:[.,]\d+)?){0,2}\s*мм)",
+    r"("
+    r"\d+(?:[.,]\d+)?(?:×\d+(?:[.,]\d+)?){1,3}(?:\s*мм)?"
+    r"|"
+    r"\d+(?:[.,]\d+)?(?:\s*[-–]\s*\d+(?:[.,]\d+)?)?\s*мм"
+    r")",
     re.I,
 )
 VOL_RE = re.compile(
@@ -193,8 +197,7 @@ GRIT_RE = re.compile(
     re.I,
 )
 ROWS_RE = re.compile(r"(\d+\s*ряд(?:а|ов)?)(?:\s+проволоки)?", re.I)
-STAR_DIM_RE = re.compile(r"(\d+\s*\*\s*\d+(?:\s*\*\s*\d+)?)")
-BORE_RE = re.compile(r"^22[,.]2[23]?\s*мм$", re.I)
+BORE_RE = re.compile(r"^(?:22[,.](?:2[23]?|3)|25[,.]4)\s*мм$", re.I)
 
 # v12 vertical labels: bbox x0 = 22.58 / 307.46, dir=(0,-1), size 5.2
 _LABEL_INSERT_X = (26.613, 311.493)
@@ -217,6 +220,11 @@ def _normalize_name(name: str) -> str:
     s = re.sub(r"\(\s*", "(", s)
     s = re.sub(r"\s*\)", ")", s)
     s = re.sub(r";\s*", "; ", s)
+    s = re.sub(r"мм\s*[xх*]", "×", s, flags=re.I)
+    prev = None
+    while prev != s:
+        prev = s
+        s = re.sub(r"(\d)\s*[xх*]\s*(\d)", r"\1×\2", s)
     return s
 
 
@@ -228,6 +236,8 @@ def _norm_measure(z: str) -> str:
     z = re.sub(r"гр\.?$", " гр.", z, flags=re.I)
     z = re.sub(r"(?<![м])л$", " л", z, flags=re.I)
     z = re.sub(r"(?<![р])г$", " г", z, flags=re.I)
+    if "×" in z and not re.search(r"мм$", z, flags=re.I):
+        z = z + " мм"
     return z.strip()
 
 
@@ -241,11 +251,6 @@ def _split_core_and_attrs(name: str) -> tuple[str, dict]:
     if sizes:
         attrs["sizes"] = tuple(_norm_measure(z) for z in sizes)
         s = SIZE_RE.sub(" ", s)
-    else:
-        stars = STAR_DIM_RE.findall(s)
-        if stars:
-            attrs["sizes"] = tuple(_norm_measure(z + " мм") for z in stars)
-            s = STAR_DIM_RE.sub(" ", s)
     vols = VOL_RE.findall(s)
     if vols:
         attrs["vol"] = tuple(_norm_measure(z) for z in vols)
@@ -276,6 +281,10 @@ def _tidy_title(title: str) -> str:
     title = re.sub(r"\s+,", ",", title)
     title = re.sub(r",\s*,", ",", title)
     title = re.sub(r"\s+", " ", title)
+    title = title.strip(" ,;.×")
+    title = re.sub(r"\s+(по|с|и|для|из)$", "", title, flags=re.I)
+    if title and title[0].islower():
+        title = title[0].upper() + title[1:]
     return title.strip(" ,;.")
 
 
@@ -291,18 +300,17 @@ def _common_title(products: list[Product]) -> str:
         else:
             break
     title = " ".join(prefix).strip(" ,;")
-    if len(title) < 12:
-        shared: list[str] = []
-        seen = set()
-        for w in word_lists[0]:
-            key = w.lower()
-            if key in seen:
-                continue
-            if all(key in {t.lower() for t in wl} for wl in word_lists):
-                shared.append(w)
-                seen.add(key)
-        if len(" ".join(shared)) > len(title):
-            title = " ".join(shared)
+    prefix_keys = {t.lower() for t in prefix}
+    shared_rest: list[str] = []
+    for w in word_lists[0]:
+        key = w.lower()
+        if key in prefix_keys:
+            continue
+        if all(key in {t.lower() for t in wl} for wl in word_lists):
+            shared_rest.append(w)
+            prefix_keys.add(key)
+    if shared_rest:
+        title = " ".join(prefix + shared_rest).strip(" ,;")
     if len(title) < 8:
         title = min(cores, key=len)
     hards = {a.get("hardness") for a in (_split_core_and_attrs(p.name)[1] for p in products)}
@@ -311,6 +319,27 @@ def _common_title(products: list[Product]) -> str:
         if hard:
             title = f"{title} {hard}"
     return _tidy_title(title)
+
+
+def _strip_bore_in_size(size: str) -> str:
+    """Drop 22,2 / 22,23 / 25,4 мм landing-hole parts from a compound size."""
+    raw = _norm_measure(size)
+    if BORE_RE.match(raw):
+        return raw
+    body = re.sub(r"\s*мм$", "", raw, flags=re.I)
+    kept = []
+    for part in body.split("×"):
+        token = part.replace(" ", "")
+        if re.match(r"^(?:22[,.](?:2[23]?|3)|25[,.]4)$", token):
+            continue
+        kept.append(part)
+    if not kept:
+        return raw
+    out = "×".join(kept)
+    if re.search(r"мм$", raw, flags=re.I) or "×" in out:
+        if not re.search(r"мм$", out, flags=re.I):
+            out += " мм"
+    return out
 
 
 def _type_sizes(sizes: tuple[str, ...] | None) -> list[str]:
@@ -323,9 +352,9 @@ def _type_sizes(sizes: tuple[str, ...] | None) -> list[str]:
             continue
         m = re.search(r"(\d+(?:[.,]\d+)?)", s)
         num = float(m.group(1).replace(",", ".")) if m else 999
-        if num < 2:
+        if num < 2 and "×" not in s:
             continue
-        kept.append(s)
+        kept.append(_strip_bore_in_size(s))
     return kept or list(sizes)
 
 
@@ -376,7 +405,11 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
         if present and len({len(v) for v in present}) == 1:
             n = len(present[0])
             varying = [i for i in range(n) if len({v[i] for v in present}) > 1]
-            bits.extend(mine_sizes[i] for i in varying if i < len(mine_sizes))
+            bits.extend(
+                _strip_bore_in_size(mine_sizes[i])
+                for i in varying
+                if i < len(mine_sizes)
+            )
         else:
             bits.extend(_type_sizes(mine_sizes))
     for key in ("vol", "thread", "hardness", "grit", "rows"):
@@ -385,11 +418,15 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
             val = mine[key]
             bits.extend(val if isinstance(val, tuple) else [val])
     leftover = _leftover_words(mine_core, title)
-    if leftover and len(set(leftovers)) > 1 and not bits:
+    if leftover and len(set(leftovers)) > 1:
         common = set(leftovers[0])
         for lo in leftovers[1:]:
             common &= set(lo)
-        bits.extend(w for w in leftover if w not in common)
+        extra = [w for w in leftover if w not in common]
+        if not bits:
+            bits.extend(extra)
+        else:
+            bits.extend(w for w in extra if w.lower() in {"тонкая", "сегмент", "турбо"})
     return ", ".join(bits) if bits else "—"
 
 

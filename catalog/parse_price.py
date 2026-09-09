@@ -16,6 +16,8 @@ SKU_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-/\.]{1,24}$")
 def clean_name(name: str, sku: str = "") -> str:
     name = name.replace("*СЛЕДОПЫТ", "«СЛЕДОПЫТ").replace('СЛЕДОПЫТ"', "СЛЕДОПЫТ»")
     name = re.sub(r'"\s*Рос+омаха\s*"', "«РОСОМАХА»", name, flags=re.I)
+    name = re.sub(r'"\s*БУЛЬДОЗЕР\s*"', "«БУЛЬДОЗЕР»", name, flags=re.I)
+    name = name.replace("натурайльного", "натурального")
     name = re.sub(r"\s+", " ", name).strip()
     name = re.sub(r"^\d{4,5}\s+", "", name)
     if sku:
