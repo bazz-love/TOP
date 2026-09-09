@@ -47,7 +47,32 @@ class Placed:
 
 
 def remaining_lines(lines: list[ProductLine]) -> list[ProductLine]:
-    return list(lines)
+    """Keep price order, except SDS burs: Basic, then 4-edge ROSOMAHA, then Duo."""
+    tagged: list[tuple[str | None, ProductLine]] = []
+    for ln in lines:
+        name = ln.products[0].name if ln.products else ""
+        kind = None
+        if "Rennbohr Basic" in name:
+            kind = "basic"
+        elif "Rennbohr Duo" in name:
+            kind = "duo"
+        elif "4 режущие грани" in name and ln.category_code.startswith("04.03"):
+            kind = "four"
+        tagged.append((kind, ln))
+    kinds = {k for k, _ in tagged if k}
+    if not {"basic", "duo", "four"} <= kinds:
+        return [ln for _, ln in tagged]
+    burs = {k: ln for k, ln in tagged if k}
+    out: list[ProductLine] = []
+    inserted = False
+    for k, ln in tagged:
+        if k:
+            if not inserted:
+                out.extend((burs["basic"], burs["four"], burs["duo"]))
+                inserted = True
+            continue
+        out.append(ln)
+    return out
 
 
 def place_pages(lines: list[ProductLine], n_pages: int) -> list[list[Placed]]:
@@ -722,7 +747,7 @@ def _draw_variant_table(
     columns: int | None = None,
 ):
     n = max(1, len(products))
-    cols = 2 if (columns is None and n > 21) else (columns or 1)
+    cols = 2 if (columns is None and n >= 20) else (columns or 1)
     if cols >= 2 and n >= 4:
         gap = 7.0
         mid_n = (n + 1) // 2
@@ -809,7 +834,28 @@ def draw_card(
         return
 
     if n > 8:
-        img_h = min(free.height * (0.28 if n > 21 else 0.42), 88 if n > 21 else 130)
+        two_col = n >= 20
+        if two_col:
+            rows = (n + 1) // 2
+            table_h = head_h + rows * row_h
+            table_h = min(table_h, max(head_h + row_h, free.height - 64))
+            img_h = max(48.0, free.height - table_h - 4)
+            img_rect = pymupdf.Rect(free.x0 + 8, free.y0, free.x1 - 8, free.y0 + img_h)
+            _place_image(page, image_png, img_rect)
+            table = pymupdf.Rect(free.x0, img_rect.y1 + 3, free.x1, free.y1)
+            _draw_variant_table(
+                page,
+                font_r,
+                table,
+                products,
+                labels,
+                row_h,
+                head_h,
+                vcenter=False,
+                columns=2,
+            )
+            return
+        img_h = min(free.height * 0.42, 130)
         img_rect = pymupdf.Rect(free.x0 + 10, free.y0, free.x1 - 10, free.y0 + img_h)
         _place_image(page, image_png, img_rect)
         table = pymupdf.Rect(free.x0, img_rect.y1 + 3, free.x1, free.y1)

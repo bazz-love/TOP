@@ -61,7 +61,19 @@ class ProductLine:
         n = len(self.products)
         if n <= 8:
             return 1
-        return min(4, (n + 6) // 7)
+        # Card heights in render.py: 167.6 cell + 7.1 gap. Two-column
+        # tables (n>=20) need fewer rows, so Basic/ROSOMAHA fit in 2
+        # slots and Duo in 3 with a large photo above the list.
+        two_col = n >= 20
+        rows = (n + 1) // 2 if two_col else n
+        table_h = 8.5 + rows * 13.0
+        min_img = 80.0 if two_col else 100.0
+        need = 28.0 + min_img + table_h
+        cell, gap = 167.6, 7.1
+        for k in range(1, 5):
+            if k * cell + (k - 1) * gap >= need:
+                return k
+        return 4
 
 
 def _cluster_rows(items: list[dict], y_tol: float = 4.0) -> list[list[dict]]:
