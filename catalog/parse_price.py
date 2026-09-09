@@ -50,7 +50,7 @@ class ProductLine:
     @property
     def slots(self) -> int:
         n = len(self.products)
-        if n <= 7:
+        if n <= 8:
             return 1
         return min(4, (n + 6) // 7)
 

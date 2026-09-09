@@ -163,19 +163,34 @@ def _wrap(font: pymupdf.Font, text: str, size: float, max_w: float) -> list[str]
 
 def _sort_variants(products: list[Product]) -> list[Product]:
     def key(p: Product):
-        sizes = [int(x) for x in re.findall(r"(\d+)\s*мм", p.name)]
-        return (sizes[-1] if sizes else 10_000, p.sku)
+        _, attrs = _split_core_and_attrs(p.name)
+        for bucket, k in enumerate(("sizes", "vol")):
+            val = attrs.get(k)
+            if not val:
+                continue
+            m = re.search(r"(\d+(?:[.,]\d+)?)", val[-1])
+            num = float(m.group(1).replace(",", ".")) if m else 0
+            return (bucket, num, p.sku)
+        return (9, 0, p.sku)
 
     return sorted(products, key=key)
 
 
 PACK_RE = re.compile(r"\s+\d+\s*/\s*\d+\s*$")
+PACK_PAREN_RE = re.compile(r"\([^()]*(?:шт|уп)[^()]*\)", re.I)
+PACK_COUNT_RE = re.compile(r"\d+\s*шт\.?", re.I)
+BOX_RE = re.compile(r"(?:^|[\s,;.])кор\.?(?=$|[\s,;.])", re.I)
 SIZE_RE = re.compile(
-    r"(\d+(?:[.,]\d+)?(?:\s*[xх]\s*\d+(?:[.,]\d+)?)?\s*мм)",
+    r"(\d+(?:[.,]\d+)?(?:\s*[-–]\s*\d+(?:[.,]\d+)?)?(?:\s*[xх]\s*\d+(?:[.,]\d+)?)?\s*мм)",
+    re.I,
+)
+VOL_RE = re.compile(
+    r"(\d+(?:[.,]\d{1,2})?\s*(?:мл|л|гр\.?|г))(?!\w)",
     re.I,
 )
 THREAD_RE = re.compile(r"\b[МM]\s*14\b")
 GRIT_RE = re.compile(r"\bP\s*\d+\b", re.I)
+BORE_RE = re.compile(r"^22[,.]2[23]?\s*мм$", re.I)
 
 # v12 vertical labels: bbox x0 = 22.58 / 307.46, dir=(0,-1), size 5.2
 _LABEL_INSERT_X = (26.613, 311.493)
@@ -201,19 +216,34 @@ def _normalize_name(name: str) -> str:
     return s
 
 
+def _norm_measure(z: str) -> str:
+    z = re.sub(r"\s+", "", z.strip())
+    z = re.sub(r"мм$", " мм", z, flags=re.I)
+    z = re.sub(r"мл$", " мл", z, flags=re.I)
+    z = re.sub(r"гр\.?$", " гр.", z, flags=re.I)
+    z = re.sub(r"(?<![м])л$", " л", z, flags=re.I)
+    z = re.sub(r"(?<![р])г$", " г", z, flags=re.I)
+    return z.strip()
+
+
 def _split_core_and_attrs(name: str) -> tuple[str, dict]:
     s = PACK_RE.sub("", _normalize_name(name)).strip()
     attrs: dict = {}
+    packs = PACK_PAREN_RE.findall(s)
+    if packs:
+        attrs["pack"] = tuple(re.sub(r"\s+", " ", p) for p in packs)
+        s = PACK_PAREN_RE.sub(" ", s)
     if THREAD_RE.search(s):
         attrs["thread"] = "М14"
         s = THREAD_RE.sub(" ", s)
     sizes = SIZE_RE.findall(s)
     if sizes:
-        attrs["sizes"] = tuple(
-            re.sub(r"\s*мм$", " мм", re.sub(r"\s+", " ", z.strip()), flags=re.I)
-            for z in sizes
-        )
+        attrs["sizes"] = tuple(_norm_measure(z) for z in sizes)
         s = SIZE_RE.sub(" ", s)
+    vols = VOL_RE.findall(s)
+    if vols:
+        attrs["vol"] = tuple(_norm_measure(z) for z in vols)
+        s = VOL_RE.sub(" ", s)
     grit = GRIT_RE.findall(s)
     if grit:
         attrs["grit"] = tuple(g.replace(" ", "").upper() for g in grit)
@@ -222,33 +252,25 @@ def _split_core_and_attrs(name: str) -> tuple[str, dict]:
         if re.search(hard, s, re.I):
             attrs["hardness"] = hard
             s = re.sub(hard, " ", s, flags=re.I)
+    s = PACK_COUNT_RE.sub(" ", s)
+    s = BOX_RE.sub(" ", s)
     s = re.sub(r"[\(\);,]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip(" ,;")
+    s = re.sub(r"\s+", " ", s).strip(" ,;.")
     return s, attrs
 
 
-def _inject_bit(title: str, bit: str) -> str:
-    if bit in title:
-        return title
-    if "для УШМ" in title:
-        return title.replace("для УШМ", f"для УШМ, {bit},", 1)
-    if "для дрели" in title:
-        return title.replace("для дрели", f"для дрели, {bit},", 1)
-    return f"{title}, {bit}"
-
-
 def _tidy_title(title: str) -> str:
+    title = re.sub(r"\s+\.$", "", title)
     title = re.sub(r"\s+,", ",", title)
     title = re.sub(r",\s*,", ",", title)
     title = re.sub(r"\s+", " ", title)
-    return title.strip(" ,;")
+    return title.strip(" ,;.")
 
 
 def _common_title(products: list[Product]) -> str:
-    if len(products) <= 1:
-        return ""
-    cores_attrs = [_split_core_and_attrs(p.name) for p in products]
-    cores = [c for c, _ in cores_attrs]
+    cores = [_split_core_and_attrs(p.name)[0] for p in products]
+    if len(products) == 1:
+        return _tidy_title(cores[0])
     word_lists = [c.split() for c in cores]
     prefix: list[str] = []
     for toks in zip(*word_lists):
@@ -258,44 +280,104 @@ def _common_title(products: list[Product]) -> str:
             break
     title = " ".join(prefix).strip(" ,;")
     if len(title) < 12:
+        shared: list[str] = []
+        seen = set()
+        for w in word_lists[0]:
+            key = w.lower()
+            if key in seen:
+                continue
+            if all(key in {t.lower() for t in wl} for wl in word_lists):
+                shared.append(w)
+                seen.add(key)
+        if len(" ".join(shared)) > len(title):
+            title = " ".join(shared)
+    if len(title) < 8:
         title = min(cores, key=len)
+    hards = {a.get("hardness") for a in (_split_core_and_attrs(p.name)[1] for p in products)}
+    if len(hards) == 1:
+        hard = next(iter(hards))
+        if hard:
+            title = f"{title} {hard}"
     return _tidy_title(title)
 
 
-def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
-    if len(siblings) == 1:
-        return _normalize_name(p.name)
-    all_attrs = [_split_core_and_attrs(s.name)[1] for s in siblings]
-    mine = _split_core_and_attrs(p.name)[1]
-    bits: list[str] = []
+def _type_sizes(sizes: tuple[str, ...] | None) -> list[str]:
+    """Keep the product size; drop bore 22,23 мм and wire gauges under 2 мм."""
+    if not sizes:
+        return []
+    kept: list[str] = []
+    for s in sizes:
+        if BORE_RE.match(s):
+            continue
+        m = re.search(r"(\d+(?:[.,]\d+)?)", s)
+        num = float(m.group(1).replace(",", ".")) if m else 999
+        if num < 2:
+            continue
+        kept.append(s)
+    return kept or list(sizes)
 
+
+def _leftover_words(core: str, title: str) -> tuple[str, ...]:
+    title_words = {w.lower().strip("«»\",.") for w in title.split()}
+    return tuple(
+        w
+        for w in core.split()
+        if w.lower().strip("«»\",.") not in title_words and len(w) > 1
+    )
+
+
+def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
+    mine_core, mine = _split_core_and_attrs_sku(p)
+    if len(siblings) == 1:
+        bits: list[str] = []
+        bits.extend(_type_sizes(mine.get("sizes")))
+        bits.extend(mine.get("vol") or ())
+        grit = mine.get("grit")
+        if grit:
+            bits.extend(grit if isinstance(grit, tuple) else [grit])
+        if mine.get("hardness"):
+            bits.append(mine["hardness"])
+        if not bits and mine.get("thread"):
+            bits.append(mine["thread"])
+        return ", ".join(bits) if bits else "—"
+
+    all_parsed = [_split_core_and_attrs_sku(s) for s in siblings]
+    all_attrs = [a for _, a in all_parsed]
+    leftovers = [_leftover_words(core, title) for core, _ in all_parsed]
+    bits = []
     size_vals = [a.get("sizes") for a in all_attrs]
     if len(set(size_vals)) > 1:
         mine_sizes = mine.get("sizes") or ()
         present = [v for v in size_vals if v]
         if present and len({len(v) for v in present}) == 1:
             n = len(present[0])
-            varying = [
-                i
-                for i in range(n)
-                if len({v[i] for v in present}) > 1
-            ]
-            if varying:
-                bits.extend(mine_sizes[i] for i in varying if i < len(mine_sizes))
-            else:
-                bits.extend(mine_sizes)
+            varying = [i for i in range(n) if len({v[i] for v in present}) > 1]
+            bits.extend(mine_sizes[i] for i in varying if i < len(mine_sizes))
         else:
-            bits.extend(mine_sizes)
-
-    for key in ("thread", "hardness"):
+            bits.extend(_type_sizes(mine_sizes))
+    for key in ("vol", "thread", "hardness", "grit"):
         vals = [a.get(key) for a in all_attrs]
         if len(set(vals)) > 1 and mine.get(key):
-            bits.append(mine[key])
-    grit_vals = [a.get("grit") for a in all_attrs]
-    if len(set(grit_vals)) > 1 and mine.get("grit"):
-        bits.extend(mine["grit"])
+            val = mine[key]
+            bits.extend(val if isinstance(val, tuple) else [val])
+    leftover = _leftover_words(mine_core, title)
+    if leftover and len(set(leftovers)) > 1 and not bits:
+        bits.extend(leftover)
+    return ", ".join(bits) if bits else "—"
 
-    return ", ".join(bits) if bits else _normalize_name(p.name)
+
+# 1C omitted pack size for some SKUs; keep in sync with the matching tube/photo.
+SKU_VOL_OVERRIDE = {
+    "55277": "100 г",  # Смазка для редукторных передач ТМ-123
+}
+
+
+def _split_core_and_attrs_sku(p: Product) -> tuple[str, dict]:
+    core, attrs = _split_core_and_attrs(p.name)
+    extra = SKU_VOL_OVERRIDE.get(p.sku)
+    if extra and not attrs.get("vol"):
+        attrs = {**attrs, "vol": (extra,)}
+    return core, attrs
 
 
 def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: str):
@@ -309,10 +391,30 @@ def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: 
         tmp[0].add_redact_annot(pymupdf.Rect(554.0, 809.5, 577.0, 829.5), fill=ORANGE)
     else:
         tmp[0].add_redact_annot(pymupdf.Rect(18.5, 809.5, 41.5, 829.5), fill=ORANGE)
+        # Even template leaves «ПРОВЕРЕНО КАЧЕСТВОМ» far from the checkmark.
+        tmp[0].add_redact_annot(
+            pymupdf.Rect(16.0, 38.0, 68.5, 60.0),
+            fill=(0.12, 0.12, 0.125),
+        )
     tmp[0].apply_redactions(images=0)
     page.show_pdf_page(page.rect, tmp, 0)
     tmp.close()
     page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    if not odd:
+        font_b = pymupdf.Font(fontfile=FONT_BOLD)
+        badge_x0 = 104.88
+        gap = 11.34  # same as odd page, badge to caption
+        right = badge_x0 - gap
+        size = 7.4
+        for text, baseline in (("ПРОВЕРЕНО", 45.4827), ("КАЧЕСТВОМ", 56.4827)):
+            tw = font_b.text_length(text, fontsize=size)
+            page.insert_text(
+                (right - tw, baseline),
+                text,
+                fontname="segoeb",
+                fontsize=size,
+                color=WHITE,
+            )
     x, y = _PAGE_NUM_POS[odd]
     # Cover the template digits only — keep the diagonal orange number block.
     if odd:
@@ -356,6 +458,21 @@ def _place_image(page: pymupdf.Page, image_png: bytes | None, dest: pymupdf.Rect
     page.insert_image(box, pixmap=pix)
 
 
+HEAD_SIZE = 5.4
+TITLE_SIZE = 8.0
+HEAD_INK = (0.52, 0.50, 0.48)
+# Wider than this (after trim) counts as a landscape photo.
+WIDE_ASPECT = 1.35
+
+
+def _image_aspect(image_png: bytes | None) -> float:
+    if not image_png:
+        return 1.0
+    with Image.open(io.BytesIO(image_png)) as im:
+        w, h = im.size
+    return (w / h) if h else 1.0
+
+
 def _draw_text_row(
     page: pymupdf.Page,
     font_r: pymupdf.Font,
@@ -394,6 +511,170 @@ def _draw_text_row(
         )
 
 
+def _draw_col_headers(
+    page: pymupdf.Page,
+    font_r: pymupdf.Font,
+    y: float,
+    name_x: float,
+    sku_left: float,
+    price_left: float,
+):
+    page.insert_text(
+        (name_x, y + HEAD_SIZE),
+        "тип",
+        fontname="segoe",
+        fontsize=HEAD_SIZE,
+        color=HEAD_INK,
+    )
+    page.insert_text(
+        (sku_left, y + HEAD_SIZE),
+        "код",
+        fontname="segoe",
+        fontsize=HEAD_SIZE,
+        color=HEAD_INK,
+    )
+    page.insert_text(
+        (price_left, y + HEAD_SIZE),
+        "цена",
+        fontname="segoe",
+        fontsize=HEAD_SIZE,
+        color=HEAD_INK,
+    )
+
+
+def _draw_title_band(
+    page: pymupdf.Page,
+    font_b: pymupdf.Font,
+    rect: pymupdf.Rect,
+    title: str,
+) -> float:
+    page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    lines = _wrap(font_b, title, TITLE_SIZE, rect.width - 16)[:2] or [title]
+    band_h = 6 + 11.2 * len(lines)
+    band = pymupdf.Rect(rect.x0 + 0.8, rect.y0 + 0.8, rect.x1 - 0.8, rect.y0 + band_h)
+    page.draw_rect(band, color=STRIP_FILL, fill=STRIP_FILL, width=0)
+    page.draw_line(
+        pymupdf.Point(band.x0 + 4, band.y1 - 0.4),
+        pymupdf.Point(band.x1 - 4, band.y1 - 0.4),
+        color=(0.86, 0.84, 0.82),
+        width=0.4,
+    )
+    y = rect.y0 + 5
+    for tl in lines:
+        page.insert_text(
+            (rect.x0 + 7.0, y + TITLE_SIZE),
+            tl,
+            fontname="segoeb",
+            fontsize=TITLE_SIZE,
+            color=INK,
+        )
+        y += 11.2
+    return band.y1 + 3
+
+
+def _table_cols(font_r: pymupdf.Font, x0: float, x1: float, products: list[Product]):
+    max_sku_w = max(font_r.text_length(p.sku, fontsize=7.2) for p in products)
+    max_price_w = max(font_r.text_length(p.price, fontsize=7.2) for p in products)
+    sku_col_w = max(max_sku_w, font_r.text_length("код", fontsize=HEAD_SIZE))
+    price_col_w = max(max_price_w, font_r.text_length("цена", fontsize=HEAD_SIZE))
+    gap = 5.0
+    price_r = x1
+    price_left = price_r - price_col_w
+    sku_r = price_left - gap
+    sku_left = sku_r - sku_col_w
+    name_x = x0
+    name_w = max(22, sku_left - gap - name_x)
+    return name_x, sku_r, price_r, name_w, sku_left, price_left
+
+
+def _draw_variant_table(
+    page: pymupdf.Page,
+    font_r: pymupdf.Font,
+    box: pymupdf.Rect,
+    products: list[Product],
+    labels: list[str],
+    row_h: float,
+    head_h: float,
+    *,
+    vcenter: bool,
+):
+    name_x, sku_r, price_r, name_w, sku_left, price_left = _table_cols(
+        font_r, box.x0, box.x1, products
+    )
+    n = max(1, len(products))
+    avail = max(1, box.height - head_h)
+    vh = min(row_h, avail / n)
+    block_h = head_h + n * vh
+    y = box.y0
+    if vcenter:
+        y += max(0, (box.height - block_h) / 2)
+    _draw_col_headers(page, font_r, y, name_x, sku_left, price_left)
+    y += head_h
+    for p, lab in zip(products, labels):
+        shown = _wrap(font_r, lab, 7.2, name_w)[0]
+        _draw_text_row(page, font_r, y, name_x, sku_r, price_r, shown, p.sku, p.price)
+        y += vh
+
+
+def draw_card(
+    page: pymupdf.Page,
+    placed: Placed,
+    image_png: bytes | None,
+    font_r: pymupdf.Font,
+    font_b: pymupdf.Font,
+):
+    page.insert_font(fontname="segoe", fontfile=FONT_REG)
+    page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    rect = _card_rect(placed.col, placed.row, placed.slots)
+    page.draw_rect(rect, color=STROKE, fill=WHITE, width=0.65, radius=0.025)
+
+    products = list(placed.line.products)
+    n = len(products)
+    if n >= 2:
+        products = _sort_variants(products)
+    title = _common_title(products)
+    labels = [_variant_label(p, products, title) for p in products]
+    row_h = 13.0
+    pad_bottom = 5.0
+    head_h = 8.5
+
+    below_title = _draw_title_band(page, font_b, rect, title)
+    free = pymupdf.Rect(rect.x0 + 6, below_title, rect.x1 - 6, rect.y1 - pad_bottom)
+
+    wide = _image_aspect(image_png) >= WIDE_ASPECT
+    split = n <= 8 and not (n <= 2 and wide)
+
+    if split:
+        mid = free.x0 + free.width * 0.48
+        img_rect = pymupdf.Rect(free.x0, free.y0, mid - 3, free.y1)
+        _place_image(page, image_png, img_rect)
+        table = pymupdf.Rect(mid + 2, free.y0, free.x1, free.y1)
+        _draw_variant_table(
+            page, font_r, table, products, labels, row_h, head_h, vcenter=True
+        )
+        return
+
+    if n > 8:
+        img_h = min(free.height * 0.42, 130)
+        img_rect = pymupdf.Rect(free.x0 + 10, free.y0, free.x1 - 10, free.y0 + img_h)
+        _place_image(page, image_png, img_rect)
+        table = pymupdf.Rect(free.x0, img_rect.y1 + 3, free.x1, free.y1)
+        _draw_variant_table(
+            page, font_r, table, products, labels, row_h, head_h, vcenter=False
+        )
+        return
+
+    table_h = head_h + n * row_h
+    img_rect = pymupdf.Rect(
+        free.x0, free.y0, free.x1, max(free.y0 + 8, free.y1 - table_h - 3)
+    )
+    _place_image(page, image_png, img_rect)
+    table = pymupdf.Rect(free.x0, free.y1 - table_h, free.x1, free.y1)
+    _draw_variant_table(
+        page, font_r, table, products, labels, row_h, head_h, vcenter=False
+    )
+
+
 def _draw_category_label(
     page: pymupdf.Page, col: int, y0: float, y1: float, text: str
 ):
@@ -419,105 +700,6 @@ def _draw_category_label(
     )
 
 
-def draw_card(
-    page: pymupdf.Page,
-    placed: Placed,
-    image_png: bytes | None,
-    font_r: pymupdf.Font,
-):
-    page.insert_font(fontname="segoe", fontfile=FONT_REG)
-    rect = _card_rect(placed.col, placed.row, placed.slots)
-    page.draw_rect(rect, color=STROKE, fill=WHITE, width=0.65, radius=0.025)
-
-    products = list(placed.line.products)
-    n = len(products)
-    if n >= 3:
-        products = _sort_variants(products)
-    name_x = rect.x0 + 7.0
-    price_r = rect.x1 - 7.0
-    sku_r = rect.x0 + 205.6
-    row_h = 13.5
-    pad_bottom = 6.0
-
-    if n <= 2:
-        wraps = [
-            _wrap(font_r, _normalize_name(p.name), 7.2, max(40, sku_r - name_x - 36))[:3]
-            for p in products
-        ]
-        text_h = sum(max(1, len(w)) * row_h for w in wraps)
-        text_top = rect.y1 - pad_bottom - text_h
-        img_rect = pymupdf.Rect(rect.x0 + 10, rect.y0 + 8, rect.x1 - 10, text_top - 4)
-        _place_image(page, image_png, img_rect)
-        y = text_top
-        for p, lines in zip(products, wraps):
-            for i, ln in enumerate(lines):
-                _draw_text_row(
-                    page,
-                    font_r,
-                    y,
-                    name_x,
-                    sku_r,
-                    price_r,
-                    ln,
-                    p.sku if i == 0 else None,
-                    p.price if i == 0 else None,
-                )
-                y += row_h
-        return
-
-    title = _common_title(products)
-    title_lines = _wrap(font_r, title, 7.2, rect.width - 16)[:2] if title else []
-    title_h = row_h * len(title_lines)
-    title_top = rect.y0 + 8
-    y = title_top
-    for tl in title_lines:
-        page.insert_text(
-            (name_x, y + 7.2),
-            tl,
-            fontname="segoe",
-            fontsize=7.2,
-            color=INK,
-        )
-        y += row_h
-    free = pymupdf.Rect(rect.x0 + 6, y + 2, rect.x1 - 6, rect.y1 - pad_bottom)
-
-    labels = [_variant_label(p, products, title) for p in products]
-
-    if n <= 7:
-        mid = (free.x0 + free.x1) / 2
-        img_rect = pymupdf.Rect(free.x0, free.y0, mid - 3, free.y1)
-        _place_image(page, image_png, img_rect)
-        var_x = mid + 2
-        max_sku_w = max(font_r.text_length(p.sku, fontsize=7.2) for p in products)
-        max_price_w = max(font_r.text_length(p.price, fontsize=7.2) for p in products)
-        var_price = free.x1
-        var_sku = var_price - max_price_w - 6
-        name_w = max(24, var_sku - max_sku_w - 6 - var_x)
-        avail = max(1, free.height)
-        vh = min(row_h, avail / max(1, n))
-        yv = free.y0 + max(0, (avail - n * vh) / 2)
-        for p, lab in zip(products, labels):
-            shown = _wrap(font_r, lab, 7.2, name_w)[0]
-            _draw_text_row(
-                page, font_r, yv, var_x, var_sku, var_price, shown, p.sku, p.price
-            )
-            yv += vh
-        return
-
-    # 8+: title, medium image, then variant list
-    img_h = min(free.height * 0.42, 120)
-    img_rect = pymupdf.Rect(free.x0 + 20, free.y0, free.x1 - 20, free.y0 + img_h)
-    _place_image(page, image_png, img_rect)
-    list_top = img_rect.y1 + 4
-    avail = max(8, free.y1 - list_top)
-    vh = min(row_h, avail / max(1, n))
-    yv = list_top
-    for p, lab in zip(products, labels):
-        shown = _wrap(font_r, lab, 7.2, max(40, sku_r - name_x - 36))[0]
-        _draw_text_row(page, font_r, yv, name_x, sku_r, price_r, shown, p.sku, p.price)
-        yv += vh
-
-
 def render_new_pages(
     catalog_src: Path,
     price_src: Path,
@@ -532,6 +714,7 @@ def render_new_pages(
 
     pages = place_pages(remaining_lines(lines), n_new)
     font_r = pymupdf.Font(fontfile=FONT_REG)
+    font_b = pymupdf.Font(fontfile=FONT_BOLD)
     img_cache: dict[tuple[int | None, int | None], bytes | None] = {}
 
     start_num = 1
@@ -563,7 +746,7 @@ def render_new_pages(
             key = (pl.line.image_page, pl.line.image_xref)
             if key not in img_cache:
                 img_cache[key] = extract_image(price, pl.line)
-            draw_card(page, pl, img_cache[key], font_r)
+            draw_card(page, pl, img_cache[key], font_r, font_b)
 
     out.save(out_path, deflate=True, garbage=4)
     out.close()
