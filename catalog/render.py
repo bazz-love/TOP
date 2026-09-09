@@ -327,7 +327,7 @@ def _leftover_words(core: str, title: str) -> tuple[str, ...]:
 
 
 def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
-    mine_core, mine = _split_core_and_attrs(p.name)
+    mine_core, mine = _split_core_and_attrs_sku(p)
     if len(siblings) == 1:
         bits: list[str] = []
         bits.extend(_type_sizes(mine.get("sizes")))
@@ -341,7 +341,7 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
             bits.append(mine["thread"])
         return ", ".join(bits) if bits else "—"
 
-    all_parsed = [_split_core_and_attrs(s.name) for s in siblings]
+    all_parsed = [_split_core_and_attrs_sku(s) for s in siblings]
     all_attrs = [a for _, a in all_parsed]
     leftovers = [_leftover_words(core, title) for core, _ in all_parsed]
     bits = []
@@ -366,6 +366,20 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
     return ", ".join(bits) if bits else "—"
 
 
+# 1C omitted pack size for some SKUs; keep in sync with the matching tube/photo.
+SKU_VOL_OVERRIDE = {
+    "55277": "100 г",  # Смазка для редукторных передач ТМ-123
+}
+
+
+def _split_core_and_attrs_sku(p: Product) -> tuple[str, dict]:
+    core, attrs = _split_core_and_attrs(p.name)
+    extra = SKU_VOL_OVERRIDE.get(p.sku)
+    if extra and not attrs.get("vol"):
+        attrs = {**attrs, "vol": (extra,)}
+    return core, attrs
+
+
 def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: str):
     """Vector-copy v12 header/footer; wipe only the product band, keep chrome."""
     tmpl = 0 if odd else 1
@@ -377,10 +391,30 @@ def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: 
         tmp[0].add_redact_annot(pymupdf.Rect(554.0, 809.5, 577.0, 829.5), fill=ORANGE)
     else:
         tmp[0].add_redact_annot(pymupdf.Rect(18.5, 809.5, 41.5, 829.5), fill=ORANGE)
+        # Even template leaves «ПРОВЕРЕНО КАЧЕСТВОМ» far from the checkmark.
+        tmp[0].add_redact_annot(
+            pymupdf.Rect(16.0, 38.0, 68.5, 60.0),
+            fill=(0.12, 0.12, 0.125),
+        )
     tmp[0].apply_redactions(images=0)
     page.show_pdf_page(page.rect, tmp, 0)
     tmp.close()
     page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    if not odd:
+        font_b = pymupdf.Font(fontfile=FONT_BOLD)
+        badge_x0 = 104.88
+        gap = 11.34  # same as odd page, badge to caption
+        right = badge_x0 - gap
+        size = 7.4
+        for text, baseline in (("ПРОВЕРЕНО", 45.4827), ("КАЧЕСТВОМ", 56.4827)):
+            tw = font_b.text_length(text, fontsize=size)
+            page.insert_text(
+                (right - tw, baseline),
+                text,
+                fontname="segoeb",
+                fontsize=size,
+                color=WHITE,
+            )
     x, y = _PAGE_NUM_POS[odd]
     # Cover the template digits only — keep the diagonal orange number block.
     if odd:
