@@ -162,26 +162,25 @@ def _wrap(font: pymupdf.Font, text: str, size: float, max_w: float) -> list[str]
 
 
 def _sort_variants(products: list[Product]) -> list[Product]:
+    def nums(val) -> tuple:
+        if not val:
+            return (0.0,)
+        token = val[-1] if isinstance(val, tuple) else val
+        found = [float(x.replace(",", ".")) for x in re.findall(r"\d+(?:[.,]\d+)?", token)]
+        return tuple(found) or (0.0,)
+
     def key(p: Product):
         _, attrs = _split_core_and_attrs(p.name)
-        for bucket, k in enumerate(("sizes", "vol")):
-            val = attrs.get(k)
-            if not val:
-                continue
-            m = re.search(r"(\d+(?:[.,]\d+)?)", val[-1])
-            num = float(m.group(1).replace(",", ".")) if m else 0
-            return (bucket, num, p.sku)
-        return (9, 0, p.sku)
+        return (nums(attrs.get("sizes")), nums(attrs.get("vol")), nums(attrs.get("grit")), p.sku)
 
     return sorted(products, key=key)
 
 
 PACK_RE = re.compile(r"\s+\d+\s*/\s*\d+\s*$")
-PACK_PAREN_RE = re.compile(r"\([^()]*(?:шт|уп)[^()]*\)", re.I)
-PACK_COUNT_RE = re.compile(r"\d+\s*шт\.?", re.I)
+PACK_COUNT_RE = re.compile(r"\d+\s*шт\.?(?:\s*[-–./]\s*\d+\s*уп\.?)?", re.I)
 BOX_RE = re.compile(r"(?:^|[\s,;.])кор\.?(?=$|[\s,;.])", re.I)
 SIZE_RE = re.compile(
-    r"(\d+(?:[.,]\d+)?(?:\s*[-–]\s*\d+(?:[.,]\d+)?)?(?:\s*[xх]\s*\d+(?:[.,]\d+)?)?\s*мм)",
+    r"(\d+(?:[.,]\d+)?(?:(?:\s*[-–]\s*|\s*[xх*]\s*)\d+(?:[.,]\d+)?){0,2}\s*мм)",
     re.I,
 )
 VOL_RE = re.compile(
@@ -189,7 +188,12 @@ VOL_RE = re.compile(
     re.I,
 )
 THREAD_RE = re.compile(r"\b[МM]\s*14\b")
-GRIT_RE = re.compile(r"\bP\s*\d+\b", re.I)
+GRIT_RE = re.compile(
+    r"(?:(?:\b[PРpр]\s*)|(?:\bзерно\s+))(\d+(?:\s*/\s*\d+)?)\b",
+    re.I,
+)
+ROWS_RE = re.compile(r"(\d+\s*ряд(?:а|ов)?)(?:\s+проволоки)?", re.I)
+STAR_DIM_RE = re.compile(r"(\d+\s*\*\s*\d+(?:\s*\*\s*\d+)?)")
 BORE_RE = re.compile(r"^22[,.]2[23]?\s*мм$", re.I)
 
 # v12 vertical labels: bbox x0 = 22.58 / 307.46, dir=(0,-1), size 5.2
@@ -217,7 +221,8 @@ def _normalize_name(name: str) -> str:
 
 
 def _norm_measure(z: str) -> str:
-    z = re.sub(r"\s+", "", z.strip())
+    z = re.sub(r"\s*[xх*]\s*", "×", z.strip())
+    z = re.sub(r"\s+", "", z)
     z = re.sub(r"мм$", " мм", z, flags=re.I)
     z = re.sub(r"мл$", " мл", z, flags=re.I)
     z = re.sub(r"гр\.?$", " гр.", z, flags=re.I)
@@ -229,10 +234,6 @@ def _norm_measure(z: str) -> str:
 def _split_core_and_attrs(name: str) -> tuple[str, dict]:
     s = PACK_RE.sub("", _normalize_name(name)).strip()
     attrs: dict = {}
-    packs = PACK_PAREN_RE.findall(s)
-    if packs:
-        attrs["pack"] = tuple(re.sub(r"\s+", " ", p) for p in packs)
-        s = PACK_PAREN_RE.sub(" ", s)
     if THREAD_RE.search(s):
         attrs["thread"] = "М14"
         s = THREAD_RE.sub(" ", s)
@@ -240,19 +241,30 @@ def _split_core_and_attrs(name: str) -> tuple[str, dict]:
     if sizes:
         attrs["sizes"] = tuple(_norm_measure(z) for z in sizes)
         s = SIZE_RE.sub(" ", s)
+    else:
+        stars = STAR_DIM_RE.findall(s)
+        if stars:
+            attrs["sizes"] = tuple(_norm_measure(z + " мм") for z in stars)
+            s = STAR_DIM_RE.sub(" ", s)
     vols = VOL_RE.findall(s)
     if vols:
         attrs["vol"] = tuple(_norm_measure(z) for z in vols)
         s = VOL_RE.sub(" ", s)
     grit = GRIT_RE.findall(s)
     if grit:
-        attrs["grit"] = tuple(g.replace(" ", "").upper() for g in grit)
+        attrs["grit"] = tuple("P" + re.sub(r"\s+", "", g) for g in grit)
         s = GRIT_RE.sub(" ", s)
+    rows = ROWS_RE.findall(s)
+    if rows:
+        attrs["rows"] = tuple(re.sub(r"\s+", " ", r.strip()) for r in rows)
+        s = ROWS_RE.sub(" ", s)
     for hard in ("жесткая", "мягкая"):
         if re.search(hard, s, re.I):
             attrs["hardness"] = hard
             s = re.sub(hard, " ", s, flags=re.I)
     s = PACK_COUNT_RE.sub(" ", s)
+    s = re.sub(r"/\s*уп\.?", " ", s, flags=re.I)
+    s = re.sub(r"картонный\s+подвес", " ", s, flags=re.I)
     s = BOX_RE.sub(" ", s)
     s = re.sub(r"[\(\);,]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip(" ,;.")
@@ -317,13 +329,24 @@ def _type_sizes(sizes: tuple[str, ...] | None) -> list[str]:
     return kept or list(sizes)
 
 
+_SKIP_LEFTOVER = {
+    "росомаха",
+    "россомаха",
+    "картонный",
+    "подвес",
+    "блистер",
+}
+
+
 def _leftover_words(core: str, title: str) -> tuple[str, ...]:
     title_words = {w.lower().strip("«»\",.") for w in title.split()}
-    return tuple(
-        w
-        for w in core.split()
-        if w.lower().strip("«»\",.") not in title_words and len(w) > 1
-    )
+    out = []
+    for w in core.split():
+        key = w.lower().strip("«»\",.")
+        if key in title_words or key in _SKIP_LEFTOVER or len(w) <= 1:
+            continue
+        out.append(w)
+    return tuple(out)
 
 
 def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
@@ -332,6 +355,7 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
         bits: list[str] = []
         bits.extend(_type_sizes(mine.get("sizes")))
         bits.extend(mine.get("vol") or ())
+        bits.extend(mine.get("rows") or ())
         grit = mine.get("grit")
         if grit:
             bits.extend(grit if isinstance(grit, tuple) else [grit])
@@ -355,14 +379,17 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
             bits.extend(mine_sizes[i] for i in varying if i < len(mine_sizes))
         else:
             bits.extend(_type_sizes(mine_sizes))
-    for key in ("vol", "thread", "hardness", "grit"):
+    for key in ("vol", "thread", "hardness", "grit", "rows"):
         vals = [a.get(key) for a in all_attrs]
         if len(set(vals)) > 1 and mine.get(key):
             val = mine[key]
             bits.extend(val if isinstance(val, tuple) else [val])
     leftover = _leftover_words(mine_core, title)
     if leftover and len(set(leftovers)) > 1 and not bits:
-        bits.extend(leftover)
+        common = set(leftovers[0])
+        for lo in leftovers[1:]:
+            common &= set(lo)
+        bits.extend(w for w in leftover if w not in common)
     return ", ".join(bits) if bits else "—"
 
 
