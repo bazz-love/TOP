@@ -837,8 +837,8 @@ def draw_card(
         two_col = n >= 20
         if two_col:
             rows = (n + 1) // 2
-            table_h = head_h + rows * row_h
-            table_h = min(table_h, max(head_h + row_h, free.height - 64))
+            min_img = max(88.0, free.height * 0.38)
+            table_h = min(head_h + rows * row_h, max(head_h + 9.0, free.height - min_img - 4))
             img_h = max(48.0, free.height - table_h - 4)
             img_rect = pymupdf.Rect(free.x0 + 8, free.y0, free.x1 - 8, free.y0 + img_h)
             _place_image(page, image_png, img_rect)
