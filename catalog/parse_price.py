@@ -15,12 +15,14 @@ SKU_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-/\.]{1,24}$")
 
 def clean_name(name: str, sku: str = "") -> str:
     name = name.replace("*СЛЕДОПЫТ", "«СЛЕДОПЫТ").replace('СЛЕДОПЫТ"', "СЛЕДОПЫТ»")
-    name = re.sub(r'"РОСОМАХА"', "«РОСОМАХА»", name)
+    name = re.sub(r'"\s*Рос+омаха\s*"', "«РОСОМАХА»", name, flags=re.I)
     name = re.sub(r"\s+", " ", name).strip()
+    name = re.sub(r"^\d{4,5}\s+", "", name)
     if sku:
         name = re.sub(rf"\s*{re.escape(sku)}\b", "", name)
     name = re.sub(r"(?:«РОСОМАХА»\s*)+", "«РОСОМАХА» ", name)
     name = re.sub(r"\s*TOLSEN\s+\d{4,5}\s*$", " TOLSEN", name)
+    name = re.sub(r"ПРАКТИКА\"", "ПРАКТИКА «", name)
     name = re.sub(r"ммTOLSEN", "мм TOLSEN", name)
     # space after comma, but keep decimal commas: 0,5л / 22,23 мм
     name = re.sub(r",(?!\d)(?=\S)", ", ", name)
