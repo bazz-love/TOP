@@ -780,8 +780,8 @@ def _draw_variant_table(
         page.draw_line(
             pymupdf.Point(x, box.y0 + 1.0),
             pymupdf.Point(x, box.y1 - 1.0),
-            color=(0.82, 0.79, 0.75),
-            width=0.35,
+            color=(0.70, 0.68, 0.65),
+            width=0.5,
         )
         return
     name_x, sku_r, price_r, name_w, sku_left, price_left = _table_cols(
