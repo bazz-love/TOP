@@ -29,8 +29,7 @@ _ROW_H = 11.0
 _HEAD_H = 7.5
 _TITLE_PAD = 26.0
 _PAD_BOTTOM = 4.0
-# Stacked photo is capped at one grid cell; reserve that height when growing.
-_MIN_STACK_IMG = _CELL_H
+_MIN_STACK_IMG = 56.0
 _SLOTS_PER_COL = 6
 
 

@@ -240,6 +240,10 @@ def _sort_variants(products: list[Product]) -> list[Product]:
 
 PACK_RE = re.compile(r"\s+\d+\s*/\s*\d+\s*$")
 PACK_COUNT_RE = re.compile(r"\d+\s*шт\.?(?:\s*[-–./]\s*\d+\s*уп\.?)?", re.I)
+COUNT_SPEC_RE = re.compile(
+    r"(\d+)\s*(предмет[аов]*|шт\.?|пр\.?(?![а-яё]))",
+    re.I,
+)
 BOX_RE = re.compile(r"(?:^|[\s,;.])кор\.?(?=$|[\s,;.])", re.I)
 SIZE_RE = re.compile(
     r"("
@@ -254,6 +258,24 @@ VOL_RE = re.compile(
     re.I,
 )
 THREAD_RE = re.compile(r"\b[МM]\s*14\b")
+THREAD_RANGE_RE = re.compile(r"[МM]\s*(\d+)\s*[-–]\s*[МM]?\s*(\d+)")
+INCH_RE = re.compile(
+    r"("
+    r"\d+\s+\d+\s*/\s*\d+\s*[\"″]"
+    r"|"
+    r"\d+\s*/\s*\d+\s*-\s*\d+\s*[A-Za-z]+"
+    r"|"
+    r"\d+\s*/\s*\d+\s*[\"″]"
+    r"|"
+    r"\d+\s*[\"″]"
+    r")"
+)
+SDS_PAIR_RE = re.compile(
+    r"(SDS\s*-?\s*MAX)\s+на\s+(SDS\s*\+?)",
+    re.I,
+)
+CX_DIA_RE = re.compile(r"ЦХ\s+(\d+(?:[.,]\d+)?)(?!\s*мм)\b", re.I)
+D_DIA_RE = re.compile(r"\bd\s*(\d+(?:[.,]\d+)?)\b", re.I)
 GRIT_RE = re.compile(
     r"(?:(?:\b[PРpр]\s*)|(?:\bзерно\s+))(\d+(?:\s*/\s*\d+)?)\b",
     re.I,
@@ -264,6 +286,11 @@ SAW_DIA_TEETH_RE = re.compile(r"(\d+)\s+(\d+)\s*зуб\.?", re.I)
 ARBOR_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s*мм", re.I)
 TEETH_RE = re.compile(r"(\d+)\s*Т\b", re.I)
 SAW_NAME_RE = re.compile(r"пильн", re.I)
+_MAT_RE = (
+    (re.compile(r"латун", re.I), "латунь"),
+    (re.compile(r"нейлон", re.I), "нейлон"),
+    (re.compile(r"стал", re.I), "сталь"),
+)
 
 # v12 vertical labels: bbox x0 = 22.58 / 307.46, dir=(0,-1), size 5.2
 _LABEL_INSERT_X = (26.613, 311.493)
@@ -310,9 +337,33 @@ def _norm_measure(z: str) -> str:
 def _split_core_and_attrs(name: str) -> tuple[str, dict]:
     s = PACK_RE.sub("", _normalize_name(name)).strip()
     attrs: dict = {}
+    if THREAD_RANGE_RE.search(s):
+        tm = THREAD_RANGE_RE.search(s)
+        attrs["thread_range"] = f"М{tm.group(1)}–М{tm.group(2)}"
+        s = THREAD_RANGE_RE.sub(" ", s)
     if THREAD_RE.search(s):
         attrs["thread"] = "М14"
         s = THREAD_RE.sub(" ", s)
+    inches = [re.sub(r"\s+", " ", i).strip() for i in INCH_RE.findall(s)]
+    if inches:
+        attrs["inch"] = tuple(inches)
+        s = INCH_RE.sub(" ", s)
+    sds = SDS_PAIR_RE.search(s)
+    if sds:
+        attrs["adapter"] = "SDS-MAX → SDS+"
+        s = SDS_PAIR_RE.sub(" ", s)
+    counts = []
+    for n, unit in COUNT_SPEC_RE.findall(s):
+        u = unit.lower()
+        if u.startswith("пред"):
+            counts.append(f"{n} предметов")
+        elif u.startswith("пр"):
+            counts.append(f"{n} пр")
+        else:
+            counts.append(f"{n} шт")
+    if counts:
+        attrs["count"] = tuple(counts)
+        s = COUNT_SPEC_RE.sub(" ", s)
     saw = SAW_DIA_TEETH_RE.search(s)
     if saw:
         attrs.setdefault("sizes", ())
@@ -341,6 +392,20 @@ def _split_core_and_attrs(name: str) -> tuple[str, dict]:
         if arbors:
             attrs["arbor"] = tuple(arbors)
         s = SIZE_RE.sub(" ", s)
+    if not attrs.get("sizes"):
+        cx = CX_DIA_RE.search(s)
+        dmark = D_DIA_RE.search(s)
+        if cx:
+            attrs["sizes"] = (_norm_measure(cx.group(1) + " мм"),)
+            s = CX_DIA_RE.sub(" ", s)
+        elif dmark:
+            attrs["sizes"] = (_norm_measure(dmark.group(1) + " мм"),)
+            s = D_DIA_RE.sub(" ", s)
+        elif re.search(r"коронк", s, re.I):
+            tail = re.search(r"(\d{2,3})\s*$", s)
+            if tail:
+                attrs["sizes"] = (_norm_measure(tail.group(1) + " мм"),)
+                s = s[: tail.start()].rstrip()
     vols = VOL_RE.findall(s)
     if vols:
         attrs["vol"] = tuple(_norm_measure(z) for z in vols)
@@ -522,23 +587,54 @@ def _arbor_bits(attrs: dict) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _spec_bits(attrs: dict, name: str = "") -> list[str]:
+    bits: list[str] = []
+    bits.extend(_type_sizes(attrs.get("sizes")))
+    bits.extend(attrs.get("vol") or ())
+    bits.extend(attrs.get("inch") or ())
+    if attrs.get("thread_range"):
+        bits.append(attrs["thread_range"])
+    if attrs.get("adapter"):
+        bits.append(attrs["adapter"])
+    bits.extend(attrs.get("rows") or ())
+    bits.extend(attrs.get("teeth") or ())
+    grit = attrs.get("grit")
+    if grit:
+        bits.extend(grit if isinstance(grit, tuple) else [grit])
+    if attrs.get("hardness"):
+        bits.append(attrs["hardness"])
+    if _is_saw(name):
+        bits.extend(_arbor_bits(attrs))
+    if not bits and attrs.get("thread"):
+        bits.append(attrs["thread"])
+    if not bits:
+        bits.extend(attrs.get("count") or ())
+    return bits
+
+
+def _material_bit(name: str) -> str | None:
+    for pat, label in _MAT_RE:
+        if pat.search(name):
+            return label
+    return None
+
+
 def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
     mine_core, mine = _split_core_and_attrs_sku(p)
     if len(siblings) == 1:
-        bits: list[str] = []
-        bits.extend(_type_sizes(mine.get("sizes")))
-        bits.extend(mine.get("vol") or ())
-        bits.extend(mine.get("rows") or ())
-        bits.extend(mine.get("teeth") or ())
-        grit = mine.get("grit")
-        if grit:
-            bits.extend(grit if isinstance(grit, tuple) else [grit])
-        if mine.get("hardness"):
-            bits.append(mine["hardness"])
-        if _is_saw(p.name):
-            bits.extend(_arbor_bits(mine))
-        if not bits and mine.get("thread"):
-            bits.append(mine["thread"])
+        bits = _spec_bits(mine, p.name)
+        if not bits:
+            extra = _material_bit(p.name)
+            if extra:
+                bits.append(extra)
+            elif re.search(r"\bDUO\b", p.name):
+                bits.append("DUO")
+            else:
+                q = re.search(r"\bс\s+(кондуктором|фрезой)\b", p.name, re.I)
+                if q:
+                    bits.append(
+                        {"кондуктором": "кондуктор", "фрезой": "фреза"}[q.group(1).lower()]
+                    )
         return ", ".join(bits) if bits else "—"
 
     all_parsed = [_split_core_and_attrs_sku(s) for s in siblings]
@@ -548,7 +644,17 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
     size_vals = [a.get("sizes") for a in all_attrs]
     if len(set(size_vals)) > 1:
         bits.extend(_differing_size_label(mine.get("sizes") or (), size_vals))
-    for key in ("vol", "thread", "hardness", "grit", "rows", "teeth"):
+    for key in (
+        "vol",
+        "thread",
+        "thread_range",
+        "hardness",
+        "grit",
+        "rows",
+        "teeth",
+        "inch",
+        "adapter",
+    ):
         vals = [a.get(key) for a in all_attrs]
         if len(set(vals)) > 1 and mine.get(key):
             val = mine[key]
@@ -565,6 +671,17 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
             bits.extend(extra)
         else:
             bits.extend(w for w in extra if w.lower() in {"тонкая", "сегмент", "турбо"})
+    if not bits:
+        count_vals = [a.get("count") for a in all_attrs]
+        if len(set(count_vals)) > 1 and mine.get("count"):
+            bits.extend(mine["count"])
+    if not bits:
+        bits = _spec_bits(mine, p.name)
+        bits.extend(w for w in leftover if w not in bits)
+        if not bits:
+            mat = _material_bit(p.name)
+            if mat:
+                bits.append(mat)
     return ", ".join(bits) if bits else "—"
 
 
@@ -586,8 +703,14 @@ SUBTITLE = (115 / 255, 95 / 255, 99 / 255)
 DARK_PANEL = (0.12, 0.12, 0.125)
 
 
-def _draw_header_type(page: pymupdf.Page, odd: bool):
-    """Re-set header type at real metrics — the v12 clip is only scaled in Y."""
+def _draw_header_type(
+    page: pymupdf.Page,
+    odd: bool,
+    left_w: float,
+    right_x0: float,
+    sy: float,
+):
+    """Title and quality captions at real metrics in the short header band."""
     page.insert_font(fontname="segoe", fontfile=FONT_REG)
     page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
     font_b = pymupdf.Font(fontfile=FONT_BOLD)
@@ -602,23 +725,12 @@ def _draw_header_type(page: pymupdf.Page, odd: bool):
     sub_w = font_r.text_length(sub, fontsize=sub_size)
     title_y = 22.2
     sub_y = 32.4
+    gap = 12.0
     if odd:
-        x = 168.94
-        page.draw_rect(
-            pymupdf.Rect(155.0, 8.0, 400.0, 36.5),
-            color=WHITE,
-            fill=WHITE,
-            width=0,
-        )
+        x = left_w + gap
         sub_x = x
     else:
-        x = 426.33 - cat_w - tov_w
-        page.draw_rect(
-            pymupdf.Rect(200.0, 8.0, 440.0, 36.5),
-            color=WHITE,
-            fill=WHITE,
-            width=0,
-        )
+        x = right_x0 - gap - cat_w - tov_w
         sub_x = x + cat_w + tov_w - sub_w
     page.insert_text((x, title_y), cat, fontname="segoeb", fontsize=title_size, color=INK)
     page.insert_text(
@@ -628,25 +740,21 @@ def _draw_header_type(page: pymupdf.Page, odd: bool):
         (sub_x, sub_y), sub, fontname="segoe", fontsize=sub_size, color=SUBTITLE
     )
 
-    cap_size = 6.2
+    cap_size = 6.0
     if odd:
-        page.draw_rect(
-            pymupdf.Rect(486.0, 16.0, 550.0, 34.5),
-            color=DARK_PANEL,
-            fill=DARK_PANEL,
-            width=0,
-        )
+        badge_x1 = right_x0 + (481.89 - 411.0236) * sy
+        tx = badge_x1 + 6.0
         for text, baseline in (("ПРОВЕРЕНО", 21.6), ("КАЧЕСТВОМ", 28.8)):
             page.insert_text(
-                (493.23, baseline),
+                (tx, baseline),
                 text,
                 fontname="segoeb",
                 fontsize=cap_size,
                 color=WHITE,
             )
     else:
-        badge_x0 = 104.88
-        right = badge_x0 - 8.0
+        badge_x0 = 104.88 * sy
+        right = badge_x0 - 5.0
         for text, baseline in (("ПРОВЕРЕНО", 21.6), ("КАЧЕСТВОМ", 28.8)):
             tw = font_b.text_length(text, fontsize=cap_size)
             page.insert_text(
@@ -659,7 +767,7 @@ def _draw_header_type(page: pymupdf.Page, odd: bool):
 
 
 def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: str):
-    """Copy v12 chrome: header stays full page width, height matches the footer."""
+    """Short full-width header: side art keeps proportion, title is re-set."""
     tmpl = 0 if odd else 1
     tmp = pymupdf.open()
     tmp.insert_pdf(src, from_page=tmpl, to_page=tmpl)
@@ -669,27 +777,62 @@ def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: 
             pymupdf.Rect(488.0, 36.0, 548.0, 62.0),
             fill=DARK_PANEL,
         )
-        tmp[0].add_redact_annot(
-            pymupdf.Rect(160.0, 24.0, 390.0, 64.0),
-            fill=WHITE,
-        )
     else:
         tmp[0].add_redact_annot(pymupdf.Rect(18.5, 809.5, 41.5, 829.5), fill=ORANGE)
         tmp[0].add_redact_annot(
             pymupdf.Rect(16.0, 38.0, 68.5, 60.0),
             fill=DARK_PANEL,
         )
-        tmp[0].add_redact_annot(
-            pymupdf.Rect(205.0, 24.0, 435.0, 64.0),
-            fill=WHITE,
-        )
     tmp[0].apply_redactions(images=0)
-    page.show_pdf_page(
+
+    sy = HEADER_H / HEADER_SRC_H
+    if odd:
+        left_src = pymupdf.Rect(0, 0, 147.4016, HEADER_SRC_H)
+        right_src = pymupdf.Rect(411.0236, 0, PAGE_W, HEADER_SRC_H)
+    else:
+        left_src = pymupdf.Rect(0, 0, 184.2520, HEADER_SRC_H)
+        right_src = pymupdf.Rect(447.8740, 0, PAGE_W, HEADER_SRC_H)
+    left_w = left_src.width * sy
+    right_w = right_src.width * sy
+    right_x0 = PAGE_W - right_w
+
+    page.draw_rect(
         pymupdf.Rect(0, 0, PAGE_W, HEADER_H),
+        color=WHITE,
+        fill=WHITE,
+        width=0,
+    )
+    page.show_pdf_page(
+        pymupdf.Rect(0, 0, left_w, HEADER_H),
         tmp,
         0,
-        clip=pymupdf.Rect(0, 0, PAGE_W, HEADER_SRC_H),
-        keep_proportion=False,
+        clip=left_src,
+        keep_proportion=True,
+    )
+    page.show_pdf_page(
+        pymupdf.Rect(right_x0, 0, PAGE_W, HEADER_H),
+        tmp,
+        0,
+        clip=right_src,
+        keep_proportion=True,
+    )
+    page.draw_rect(
+        pymupdf.Rect(0, 0, PAGE_W, max(2.2, 3.685 * sy)),
+        color=ORANGE,
+        fill=ORANGE,
+        width=0,
+    )
+    page.draw_line(
+        pymupdf.Point(0, HEADER_H - 0.85),
+        pymupdf.Point(PAGE_W, HEADER_H - 0.85),
+        color=ORANGE,
+        width=0.7,
+    )
+    page.draw_line(
+        pymupdf.Point(0, HEADER_H),
+        pymupdf.Point(PAGE_W, HEADER_H),
+        color=DARK_PANEL,
+        width=0.45,
     )
     page.show_pdf_page(
         pymupdf.Rect(0, FOOTER_Y, PAGE_W, PAGE_H),
@@ -705,7 +848,7 @@ def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: 
         width=0,
     )
     page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
-    _draw_header_type(page, odd)
+    _draw_header_type(page, odd, left_w, right_x0, sy)
     x, y = _PAGE_NUM_POS[odd]
     if odd:
         page.draw_rect(
@@ -1016,9 +1159,12 @@ def draw_card(
         return
 
     rows = (n + 1) // 2 if n >= 2 else n
-    table_h = min(head_h + rows * row_h, max(head_h + 9.0, free.height - 40.0))
-    # Photo no taller than one grid cell, even if the stacked card has leftover room.
-    img_h = min(CELL_H, max(40.0, free.height - table_h - 3))
+    min_img = max(52.0, free.height * 0.30)
+    table_h = min(
+        head_h + rows * row_h,
+        max(head_h + 9.0, free.height - min_img - 3),
+    )
+    img_h = max(40.0, free.height - table_h - 3)
     img_rect = pymupdf.Rect(free.x0 + 10, free.y0, free.x1 - 10, free.y0 + img_h)
     _place_image(page, image_png, img_rect)
     table = pymupdf.Rect(free.x0, img_rect.y1 + 3, free.x1, free.y1)
