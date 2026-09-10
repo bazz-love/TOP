@@ -1,4 +1,4 @@
-"""Render catalog pages in the v12 chrome: 2×4 grid, column-major, growing line blocks."""
+"""Render catalog pages in the v12 chrome: 2×6 grid, column-major, growing line blocks."""
 
 from __future__ import annotations
 
@@ -14,20 +14,24 @@ from catalog.fonts import SEGOE_BOLD, SEGOE_REG, ensure_segoe_fonts
 from catalog.parse_price import Product, ProductLine, uses_two_col_table
 
 PAGE_W, PAGE_H = 595.27557, 841.88977
-HEADER_H = 90.7
-FOOTER_Y = 796.5
-
+FOOTER_Y = 796.54
+HEADER_SRC_H = 90.71
+HEADER_H = PAGE_H - FOOTER_Y  # match footer height
+CONTENT_TOP = 52.0
+CONTENT_BOTTOM = 790.5
 COL_X = (33.9, 318.8)
-ROW_Y = (99.2, 273.9, 448.6, 623.3)
-CELL_W, CELL_H = 256.7, 167.6
-ROW_GAP = 7.1
-SLOTS_PER_COL = 4
+CELL_W = 256.7
+ROW_GAP = 5.6
+SLOTS_PER_COL = 6
+CELL_H = (CONTENT_BOTTOM - CONTENT_TOP - (SLOTS_PER_COL - 1) * ROW_GAP) / SLOTS_PER_COL
+ROW_Y = tuple(CONTENT_TOP + i * (CELL_H + ROW_GAP) for i in range(SLOTS_PER_COL))
 
 STROKE = (0.82, 0.79, 0.75)
 LABEL = (158 / 255, 153 / 255, 148 / 255)  # #9e9994
 INK = (28 / 255, 26 / 255, 23 / 255)  # #1c1a17
 ORANGE = (1.0, 0.4, 0.0)
 WHITE = (1, 1, 1)
+RULE = (0.82, 0.80, 0.77)
 
 FONT_REG = str(SEGOE_REG)
 FONT_BOLD = str(SEGOE_BOLD)
@@ -36,6 +40,9 @@ FONT_BOLD = str(SEGOE_BOLD)
 STRIP_X = ((19.84, 30.47), (304.72, 315.35))
 STRIP_FILL = (0.965, 0.965, 0.968)
 STRIP_STROKE = (0.90, 0.90, 0.92)
+
+# Last SKU of the assortment already in the 16-page catalog; fill that page after it.
+CORE_UNTIL_SKU = "DR079-1"
 
 
 @dataclass
@@ -79,10 +86,19 @@ def _section(code: str) -> str:
     return code.split(".", 1)[0]
 
 
-def place_pages(lines: list[ProductLine], n_pages: int) -> list[list[Placed]]:
-    """Column-major pack. If a tall block cannot use a leftover slot, pull the
-    next same-section item that fits (a single into a single hole) instead of
-    leaving a gap. Items never jump into a different section (03 vs 04)."""
+def _has_sku(page: list[Placed], sku: str) -> bool:
+    return any(any(p.sku == sku for p in pl.line.products) for pl in page)
+
+
+def place_pages(
+    lines: list[ProductLine],
+    n_pages: int | None = None,
+    *,
+    fill_last: bool = True,
+) -> list[list[Placed]]:
+    """Column-major pack. Tall blocks that miss a leftover slot yield to a later
+    same-section item. After the current assortment (CORE_UNTIL_SKU) is placed,
+    keep filling the last page so it does not end with empty slots."""
     pages: list[list[Placed]] = []
     used = [0, 0]
     page: list[Placed] = []
@@ -107,36 +123,59 @@ def place_pages(lines: list[ProductLine], n_pages: int) -> list[list[Placed]]:
             return True
         return False
 
-    def pull_filler(blocked_at: int) -> bool:
+    def pull_filler(blocked_at: int, any_section: bool = False) -> bool:
         if used[0] >= SLOTS_PER_COL and used[1] >= SLOTS_PER_COL:
             return False
         sec = _section(queue[blocked_at].category_code)
         hole = [SLOTS_PER_COL - used[0], SLOTS_PER_COL - used[1]]
         for j in range(blocked_at + 1, len(queue)):
             other = queue[j]
-            if _section(other.category_code) != sec:
+            if not any_section and _section(other.category_code) != sec:
                 return False
             if min(other.slots, SLOTS_PER_COL) <= max(hole):
                 queue.insert(blocked_at, queue.pop(j))
                 return True
         return False
 
+    def core_done() -> bool:
+        return _has_sku(page, CORE_UNTIL_SKU) or any(
+            _has_sku(p, CORE_UNTIL_SKU) for p in pages
+        )
+
     i = 0
-    while i < len(queue) and len(pages) < n_pages:
+    while i < len(queue):
+        if n_pages is not None and len(pages) >= n_pages:
+            break
         if try_place(queue[i]):
             i += 1
             if used[0] == SLOTS_PER_COL and used[1] == SLOTS_PER_COL:
                 new_page()
+                if fill_last and core_done():
+                    break
             continue
-        if pull_filler(i):
+        if pull_filler(i, any_section=fill_last and core_done()):
             continue
         if not page:
             break
+        if fill_last and core_done():
+            # Last sheet of the current assortment: only keep items that fit.
+            while i < len(queue) and (
+                used[0] < SLOTS_PER_COL or used[1] < SLOTS_PER_COL
+            ):
+                if try_place(queue[i]):
+                    i += 1
+                elif pull_filler(i, any_section=True):
+                    continue
+                else:
+                    i += 1
+            break
         new_page()
+        if n_pages is not None and len(pages) >= n_pages:
+            break
 
-    if page and len(pages) < n_pages:
+    if page and (n_pages is None or len(pages) < n_pages):
         pages.append(page)
-    return pages[:n_pages]
+    return pages if n_pages is None else pages[:n_pages]
 
 
 def _trim_white(png: bytes) -> bytes:
@@ -574,32 +613,46 @@ def _split_core_and_attrs_sku(p: Product) -> tuple[str, dict]:
 
 
 def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: str):
-    """Vector-copy v12 header/footer; wipe only the product band, keep chrome."""
+    """Copy v12 header/footer; shrink the header to the footer height."""
     tmpl = 0 if odd else 1
     tmp = pymupdf.open()
     tmp.insert_pdf(src, from_page=tmpl, to_page=tmpl)
-    # Inset so the header line at 90.7 and footer at 796.5 stay untouched.
-    tmp[0].add_redact_annot(pymupdf.Rect(0, 92.0, PAGE_W, 795.5), fill=WHITE)
     if odd:
         tmp[0].add_redact_annot(pymupdf.Rect(554.0, 809.5, 577.0, 829.5), fill=ORANGE)
     else:
         tmp[0].add_redact_annot(pymupdf.Rect(18.5, 809.5, 41.5, 829.5), fill=ORANGE)
-        # Even template leaves «ПРОВЕРЕНО КАЧЕСТВОМ» far from the checkmark.
         tmp[0].add_redact_annot(
             pymupdf.Rect(16.0, 38.0, 68.5, 60.0),
             fill=(0.12, 0.12, 0.125),
         )
     tmp[0].apply_redactions(images=0)
-    page.show_pdf_page(page.rect, tmp, 0)
+    page.show_pdf_page(
+        pymupdf.Rect(0, 0, PAGE_W, HEADER_H),
+        tmp,
+        0,
+        clip=pymupdf.Rect(0, 0, PAGE_W, HEADER_SRC_H),
+    )
+    page.show_pdf_page(
+        pymupdf.Rect(0, FOOTER_Y, PAGE_W, PAGE_H),
+        tmp,
+        0,
+        clip=pymupdf.Rect(0, FOOTER_Y, PAGE_W, PAGE_H),
+    )
     tmp.close()
+    page.draw_rect(
+        pymupdf.Rect(0, HEADER_H - 0.15, PAGE_W, FOOTER_Y + 0.15),
+        color=WHITE,
+        fill=WHITE,
+        width=0,
+    )
     page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
     if not odd:
         font_b = pymupdf.Font(fontfile=FONT_BOLD)
         badge_x0 = 104.88
-        gap = 11.34  # same as odd page, badge to caption
+        gap = 8.0
         right = badge_x0 - gap
-        size = 7.4
-        for text, baseline in (("ПРОВЕРЕНО", 45.4827), ("КАЧЕСТВОМ", 56.4827)):
+        size = 6.2
+        for text, baseline in (("ПРОВЕРЕНО", 21.6), ("КАЧЕСТВОМ", 28.8)):
             tw = font_b.text_length(text, fontsize=size)
             page.insert_text(
                 (right - tw, baseline),
@@ -609,7 +662,6 @@ def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: 
                 color=WHITE,
             )
     x, y = _PAGE_NUM_POS[odd]
-    # Cover the template digits only — keep the diagonal orange number block.
     if odd:
         page.draw_rect(
             pymupdf.Rect(554.0, 809.5, 577.0, 829.5),
@@ -651,8 +703,8 @@ def _place_image(page: pymupdf.Page, image_png: bytes | None, dest: pymupdf.Rect
     page.insert_image(box, pixmap=pix)
 
 
-HEAD_SIZE = 5.4
-TITLE_SIZE = 8.0
+HEAD_SIZE = 5.0
+TITLE_SIZE = 7.2
 HEAD_INK = (0.52, 0.50, 0.48)
 # Wider than this (after trim) counts as a landscape photo.
 WIDE_ASPECT = 1.35
@@ -676,31 +728,32 @@ def _draw_text_row(
     name: str,
     sku: str | None,
     price: str | None,
-    name_size: float = 7.2,
+    name_size: float = 6.6,
 ):
     page.insert_text(
-        (name_x, y + 7.2),
+        (name_x, y + 7.0),
         name,
         fontname="segoe",
         fontsize=name_size,
         color=INK,
     )
+    body = 6.6
     if sku:
-        sku_w = font_r.text_length(sku, fontsize=7.2)
+        sku_w = font_r.text_length(sku, fontsize=body)
         page.insert_text(
-            (sku_r - sku_w, y + 7.2),
+            (sku_r - sku_w, y + 7.0),
             sku,
             fontname="segoe",
-            fontsize=7.2,
+            fontsize=body,
             color=INK,
         )
     if price:
-        price_w = font_r.text_length(price, fontsize=7.2)
+        price_w = font_r.text_length(price, fontsize=body)
         page.insert_text(
-            (price_r - price_w, y + 7.2),
+            (price_r - price_w, y + 7.0),
             price,
             fontname="segoe",
-            fontsize=7.2,
+            fontsize=body,
             color=INK,
         )
 
@@ -744,7 +797,7 @@ def _draw_title_band(
 ) -> float:
     page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
     lines = _wrap(font_b, title, TITLE_SIZE, rect.width - 16)[:2] or [title]
-    band_h = 6 + 11.2 * len(lines)
+    band_h = 4.6 + 10.0 * len(lines)
     band = pymupdf.Rect(rect.x0 + 0.8, rect.y0 + 0.8, rect.x1 - 0.8, rect.y0 + band_h)
     page.draw_rect(band, color=STRIP_FILL, fill=STRIP_FILL, width=0)
     page.draw_line(
@@ -753,7 +806,7 @@ def _draw_title_band(
         color=(0.86, 0.84, 0.82),
         width=0.4,
     )
-    y = rect.y0 + 5
+    y = rect.y0 + 3.6
     for tl in lines:
         page.insert_text(
             (rect.x0 + 7.0, y + TITLE_SIZE),
@@ -762,16 +815,17 @@ def _draw_title_band(
             fontsize=TITLE_SIZE,
             color=INK,
         )
-        y += 11.2
-    return band.y1 + 3
+        y += 10.0
+    return band.y1 + 2.0
 
 
 def _table_cols(font_r: pymupdf.Font, x0: float, x1: float, products: list[Product]):
-    max_sku_w = max(font_r.text_length(p.sku, fontsize=7.2) for p in products)
-    max_price_w = max(font_r.text_length(p.price, fontsize=7.2) for p in products)
+    body = 6.6
+    max_sku_w = max(font_r.text_length(p.sku, fontsize=body) for p in products)
+    max_price_w = max(font_r.text_length(p.price, fontsize=body) for p in products)
     sku_col_w = max(max_sku_w, font_r.text_length("код", fontsize=HEAD_SIZE))
     price_col_w = max(max_price_w, font_r.text_length("цена", fontsize=HEAD_SIZE))
-    gap = 5.0
+    gap = 4.0
     price_r = x1
     price_left = price_r - price_col_w
     sku_r = price_left - gap
@@ -792,11 +846,12 @@ def _draw_variant_table(
     *,
     vcenter: bool,
     columns: int | None = None,
+    row_rules: bool = False,
 ):
     n = max(1, len(products))
     cols = 2 if (columns is None and uses_two_col_table(n)) else (columns or 1)
-    if cols >= 2 and n >= 4:
-        gap = 8.0
+    if cols >= 2 and n >= 2:
+        gap = 6.0
         mid_n = (n + 1) // 2
         col_w = (box.width - gap) / 2
         left = pymupdf.Rect(box.x0, box.y0, box.x0 + col_w, box.y1)
@@ -811,6 +866,7 @@ def _draw_variant_table(
             head_h,
             vcenter=vcenter,
             columns=1,
+            row_rules=row_rules,
         )
         _draw_variant_table(
             page,
@@ -822,6 +878,7 @@ def _draw_variant_table(
             head_h,
             vcenter=vcenter,
             columns=1,
+            row_rules=row_rules,
         )
         x = box.x0 + col_w + gap / 2
         page.draw_line(
@@ -843,22 +900,30 @@ def _draw_variant_table(
         y += max(0, (box.height - block_h) / 2)
     _draw_col_headers(page, font_r, y, name_x, sku_left, price_left)
     y += head_h
-    for p, lab in zip(products, labels):
-        name_size = 7.2
+    for i, (p, lab) in enumerate(zip(products, labels)):
+        name_size = 6.6
         if _is_saw(p.name):
             shown = lab
             if font_r.text_length(lab, fontsize=name_size) > name_w:
                 name_size = max(
-                    6.2,
+                    5.6,
                     name_size
                     * name_w
                     / max(1.0, font_r.text_length(lab, fontsize=name_size)),
                 )
         else:
-            shown = _wrap(font_r, lab, 7.2, name_w)[0]
+            shown = _wrap(font_r, lab, name_size, name_w)[0]
         _draw_text_row(
             page, font_r, y, name_x, sku_r, price_r, shown, p.sku, p.price, name_size
         )
+        if row_rules and i + 1 < n:
+            page.draw_line(
+                pymupdf.Point(name_x, y + vh),
+                pymupdf.Point(price_r, y + vh),
+                color=RULE,
+                width=0.35,
+                dashes="[1.1 1.4]",
+            )
         y += vh
 
 
@@ -880,65 +945,52 @@ def draw_card(
         products = _sort_variants(products)
     title = _common_title(products)
     labels = [_variant_label(p, products, title) for p in products]
-    row_h = 13.0
-    pad_bottom = 5.0
-    head_h = 8.5
+    row_h = 11.0
+    pad_bottom = 4.0
+    head_h = 7.5
 
     below_title = _draw_title_band(page, font_b, rect, title)
-    free = pymupdf.Rect(rect.x0 + 6, below_title, rect.x1 - 6, rect.y1 - pad_bottom)
+    free = pymupdf.Rect(rect.x0 + 5, below_title, rect.x1 - 5, rect.y1 - pad_bottom)
 
-    wide = _image_aspect(image_png) >= WIDE_ASPECT
-    split = n <= 8 and not (n <= 2 and wide)
-
-    if split:
-        mid = free.x0 + free.width * 0.48
-        img_rect = pymupdf.Rect(free.x0, free.y0, mid - 3, free.y1)
+    if placed.slots == 1:
+        mid = free.x0 + free.width * 0.50
+        img_rect = pymupdf.Rect(free.x0, free.y0, mid - 2, free.y1)
         _place_image(page, image_png, img_rect)
         table = pymupdf.Rect(mid + 2, free.y0, free.x1, free.y1)
         _draw_variant_table(
-            page, font_r, table, products, labels, row_h, head_h, vcenter=True
+            page,
+            font_r,
+            table,
+            products,
+            labels,
+            row_h,
+            head_h,
+            vcenter=True,
+            columns=1,
         )
         return
 
-    if n > 8:
-        two_col = uses_two_col_table(n)
-        if two_col:
-            rows = (n + 1) // 2
-            min_img = max(88.0, free.height * 0.38)
-            table_h = min(head_h + rows * row_h, max(head_h + 9.0, free.height - min_img - 4))
-            img_h = max(48.0, free.height - table_h - 4)
-            img_rect = pymupdf.Rect(free.x0 + 8, free.y0, free.x1 - 8, free.y0 + img_h)
-            _place_image(page, image_png, img_rect)
-            table = pymupdf.Rect(free.x0, img_rect.y1 + 3, free.x1, free.y1)
-            _draw_variant_table(
-                page,
-                font_r,
-                table,
-                products,
-                labels,
-                row_h,
-                head_h,
-                vcenter=False,
-                columns=2,
-            )
-            return
-        img_h = min(free.height * 0.42, 130)
-        img_rect = pymupdf.Rect(free.x0 + 10, free.y0, free.x1 - 10, free.y0 + img_h)
-        _place_image(page, image_png, img_rect)
-        table = pymupdf.Rect(free.x0, img_rect.y1 + 3, free.x1, free.y1)
-        _draw_variant_table(
-            page, font_r, table, products, labels, row_h, head_h, vcenter=False
-        )
-        return
-
-    table_h = head_h + n * row_h
-    img_rect = pymupdf.Rect(
-        free.x0, free.y0, free.x1, max(free.y0 + 8, free.y1 - table_h - 3)
+    rows = (n + 1) // 2 if n >= 2 else n
+    min_img = max(52.0, free.height * 0.30)
+    table_h = min(
+        head_h + rows * row_h,
+        max(head_h + 9.0, free.height - min_img - 3),
     )
+    img_h = max(40.0, free.height - table_h - 3)
+    img_rect = pymupdf.Rect(free.x0 + 10, free.y0, free.x1 - 10, free.y0 + img_h)
     _place_image(page, image_png, img_rect)
-    table = pymupdf.Rect(free.x0, free.y1 - table_h, free.x1, free.y1)
+    table = pymupdf.Rect(free.x0, img_rect.y1 + 3, free.x1, free.y1)
     _draw_variant_table(
-        page, font_r, table, products, labels, row_h, head_h, vcenter=False
+        page,
+        font_r,
+        table,
+        products,
+        labels,
+        row_h,
+        head_h,
+        vcenter=False,
+        columns=2 if n >= 2 else 1,
+        row_rules=True,
     )
 
 
@@ -972,7 +1024,7 @@ def render_new_pages(
     price_src: Path,
     lines: list[ProductLine],
     out_path: Path,
-    n_new: int = 4,
+    n_new: int | None = None,
 ) -> list[list[Placed]]:
     ensure_segoe_fonts()
     src = pymupdf.open(catalog_src)

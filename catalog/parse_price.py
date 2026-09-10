@@ -22,41 +22,43 @@ def latinize_sku(text: str) -> str:
     return text.translate(_SKU_CYR_TO_LAT)
 
 
-# Card geometry — keep in sync with catalog.render
-_CELL_H = 167.6
-_ROW_GAP = 7.1
-_ROW_H = 13.0
-_HEAD_H = 8.5
-_TITLE_PAD = 28.0
+# Card geometry — keep in sync with catalog.render (2×6 grid)
+_CELL_H = (790.5 - 52.0 - 5 * 5.6) / 6
+_ROW_GAP = 5.6
+_ROW_H = 11.0
+_HEAD_H = 7.5
+_TITLE_PAD = 26.0
+_PAD_BOTTOM = 4.0
+_MIN_STACK_IMG = 56.0
+_SLOTS_PER_COL = 6
 
 
-def stacked_slot_count(n: int, two_col: bool) -> int:
-    """How many 2×4 grid slots a stacked (n>8) card needs."""
-    if n <= 8:
+def max_split_rows() -> int:
+    """How many variant rows fit beside the photo in a single 2×6 cell."""
+    avail = _CELL_H - _TITLE_PAD - _PAD_BOTTOM
+    return max(1, int((avail - _HEAD_H) / _ROW_H))
+
+
+def stacked_slot_count(n: int) -> int:
+    """Slots for a card: split single while the table fits, else stacked 2-col."""
+    if n <= max_split_rows():
         return 1
-    rows = (n + 1) // 2 if two_col else n
+    rows = (n + 1) // 2
     table_h = _HEAD_H + rows * _ROW_H
-    min_img = 80.0 if two_col else 100.0
-    need = _TITLE_PAD + min_img + table_h
-    for k in range(1, 5):
+    need = _TITLE_PAD + _MIN_STACK_IMG + 4.0 + table_h
+    for k in range(2, _SLOTS_PER_COL + 1):
         if k * _CELL_H + (k - 1) * _ROW_GAP >= need:
             return k
-    return 4
+    return _SLOTS_PER_COL
 
 
 def uses_two_col_table(n: int) -> bool:
-    """Two variant columns only when that shrinks the card (e.g. 3 slots → 2)."""
-    if n <= 8:
-        return False
-    return stacked_slot_count(n, True) < stacked_slot_count(n, False)
+    """Grown (2+ slot) cards put variants in two columns."""
+    return stacked_slot_count(n) > 1
 
 
 def product_line_slots(n: int) -> int:
-    if n <= 8:
-        return 1
-    one = stacked_slot_count(n, False)
-    two = stacked_slot_count(n, True)
-    return two if two < one else one
+    return stacked_slot_count(n)
 
 
 def clean_name(name: str, sku: str = "") -> str:

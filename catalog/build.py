@@ -15,7 +15,7 @@ OUT = ROOT / "katalog_v13.pdf"
 def main() -> None:
     lines = parse_price(PRICE)
     rest = remaining_lines(lines)
-    pages = render_new_pages(SRC, PRICE, lines, OUT, n_new=16)
+    pages = render_new_pages(SRC, PRICE, lines, OUT)
     print(f"wrote {OUT}  ({len(pages)} pages)")
     for i, page in enumerate(pages, start=1):
         print(f"  page {i:02d}")
