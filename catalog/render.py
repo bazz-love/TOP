@@ -41,10 +41,6 @@ STRIP_X = ((19.84, 30.47), (304.72, 315.35))
 STRIP_FILL = (0.965, 0.965, 0.968)
 STRIP_STROKE = (0.90, 0.90, 0.92)
 
-# Last SKU of the assortment already in the 16-page catalog; fill that page after it.
-CORE_UNTIL_SKU = "DR079-1"
-
-
 @dataclass
 class Placed:
     line: ProductLine
@@ -86,19 +82,12 @@ def _section(code: str) -> str:
     return code.split(".", 1)[0]
 
 
-def _has_sku(page: list[Placed], sku: str) -> bool:
-    return any(any(p.sku == sku for p in pl.line.products) for pl in page)
-
-
 def place_pages(
     lines: list[ProductLine],
     n_pages: int | None = None,
-    *,
-    fill_last: bool = True,
 ) -> list[list[Placed]]:
-    """Column-major pack. Tall blocks that miss a leftover slot yield to a later
-    same-section item. After the current assortment (CORE_UNTIL_SKU) is placed,
-    keep filling the last page so it does not end with empty slots."""
+    """Column-major pack of the full price list. Tall blocks that miss a leftover
+    slot yield to a later same-section item."""
     pages: list[list[Placed]] = []
     used = [0, 0]
     page: list[Placed] = []
@@ -123,24 +112,19 @@ def place_pages(
             return True
         return False
 
-    def pull_filler(blocked_at: int, any_section: bool = False) -> bool:
+    def pull_filler(blocked_at: int) -> bool:
         if used[0] >= SLOTS_PER_COL and used[1] >= SLOTS_PER_COL:
             return False
         sec = _section(queue[blocked_at].category_code)
         hole = [SLOTS_PER_COL - used[0], SLOTS_PER_COL - used[1]]
         for j in range(blocked_at + 1, len(queue)):
             other = queue[j]
-            if not any_section and _section(other.category_code) != sec:
+            if _section(other.category_code) != sec:
                 return False
             if min(other.slots, SLOTS_PER_COL) <= max(hole):
                 queue.insert(blocked_at, queue.pop(j))
                 return True
         return False
-
-    def core_done() -> bool:
-        return _has_sku(page, CORE_UNTIL_SKU) or any(
-            _has_sku(p, CORE_UNTIL_SKU) for p in pages
-        )
 
     i = 0
     while i < len(queue):
@@ -150,24 +134,10 @@ def place_pages(
             i += 1
             if used[0] == SLOTS_PER_COL and used[1] == SLOTS_PER_COL:
                 new_page()
-                if fill_last and core_done():
-                    break
             continue
-        if pull_filler(i, any_section=fill_last and core_done()):
+        if pull_filler(i):
             continue
         if not page:
-            break
-        if fill_last and core_done():
-            # Last sheet of the current assortment: only keep items that fit.
-            while i < len(queue) and (
-                used[0] < SLOTS_PER_COL or used[1] < SLOTS_PER_COL
-            ):
-                if try_place(queue[i]):
-                    i += 1
-                elif pull_filler(i, any_section=True):
-                    continue
-                else:
-                    i += 1
             break
         new_page()
         if n_pages is not None and len(pages) >= n_pages:
@@ -612,18 +582,106 @@ def _split_core_and_attrs_sku(p: Product) -> tuple[str, dict]:
     return core, attrs
 
 
+SUBTITLE = (115 / 255, 95 / 255, 99 / 255)
+DARK_PANEL = (0.12, 0.12, 0.125)
+
+
+def _draw_header_type(page: pymupdf.Page, odd: bool):
+    """Re-set header type at real metrics — the v12 clip is only scaled in Y."""
+    page.insert_font(fontname="segoe", fontfile=FONT_REG)
+    page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    font_b = pymupdf.Font(fontfile=FONT_BOLD)
+    font_r = pymupdf.Font(fontfile=FONT_REG)
+    title_size = 13.5
+    sub_size = 5.8
+    cat = "КАТАЛОГ "
+    tov = "ТОВАРОВ"
+    sub = "ПРОФЕССИОНАЛЬНЫЙ ИНСТРУМЕНТ И ОСНАСТКА"
+    cat_w = font_b.text_length(cat, fontsize=title_size)
+    tov_w = font_b.text_length(tov, fontsize=title_size)
+    sub_w = font_r.text_length(sub, fontsize=sub_size)
+    title_y = 22.2
+    sub_y = 32.4
+    if odd:
+        x = 168.94
+        page.draw_rect(
+            pymupdf.Rect(155.0, 8.0, 400.0, 36.5),
+            color=WHITE,
+            fill=WHITE,
+            width=0,
+        )
+        sub_x = x
+    else:
+        x = 426.33 - cat_w - tov_w
+        page.draw_rect(
+            pymupdf.Rect(200.0, 8.0, 440.0, 36.5),
+            color=WHITE,
+            fill=WHITE,
+            width=0,
+        )
+        sub_x = x + cat_w + tov_w - sub_w
+    page.insert_text((x, title_y), cat, fontname="segoeb", fontsize=title_size, color=INK)
+    page.insert_text(
+        (x + cat_w, title_y), tov, fontname="segoeb", fontsize=title_size, color=ORANGE
+    )
+    page.insert_text(
+        (sub_x, sub_y), sub, fontname="segoe", fontsize=sub_size, color=SUBTITLE
+    )
+
+    cap_size = 6.2
+    if odd:
+        page.draw_rect(
+            pymupdf.Rect(486.0, 16.0, 550.0, 34.5),
+            color=DARK_PANEL,
+            fill=DARK_PANEL,
+            width=0,
+        )
+        for text, baseline in (("ПРОВЕРЕНО", 21.6), ("КАЧЕСТВОМ", 28.8)):
+            page.insert_text(
+                (493.23, baseline),
+                text,
+                fontname="segoeb",
+                fontsize=cap_size,
+                color=WHITE,
+            )
+    else:
+        badge_x0 = 104.88
+        right = badge_x0 - 8.0
+        for text, baseline in (("ПРОВЕРЕНО", 21.6), ("КАЧЕСТВОМ", 28.8)):
+            tw = font_b.text_length(text, fontsize=cap_size)
+            page.insert_text(
+                (right - tw, baseline),
+                text,
+                fontname="segoeb",
+                fontsize=cap_size,
+                color=WHITE,
+            )
+
+
 def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: str):
-    """Copy v12 header/footer; shrink the header to the footer height."""
+    """Copy v12 chrome: header stays full page width, height matches the footer."""
     tmpl = 0 if odd else 1
     tmp = pymupdf.open()
     tmp.insert_pdf(src, from_page=tmpl, to_page=tmpl)
     if odd:
         tmp[0].add_redact_annot(pymupdf.Rect(554.0, 809.5, 577.0, 829.5), fill=ORANGE)
+        tmp[0].add_redact_annot(
+            pymupdf.Rect(488.0, 36.0, 548.0, 62.0),
+            fill=DARK_PANEL,
+        )
+        tmp[0].add_redact_annot(
+            pymupdf.Rect(160.0, 24.0, 390.0, 64.0),
+            fill=WHITE,
+        )
     else:
         tmp[0].add_redact_annot(pymupdf.Rect(18.5, 809.5, 41.5, 829.5), fill=ORANGE)
         tmp[0].add_redact_annot(
             pymupdf.Rect(16.0, 38.0, 68.5, 60.0),
-            fill=(0.12, 0.12, 0.125),
+            fill=DARK_PANEL,
+        )
+        tmp[0].add_redact_annot(
+            pymupdf.Rect(205.0, 24.0, 435.0, 64.0),
+            fill=WHITE,
         )
     tmp[0].apply_redactions(images=0)
     page.show_pdf_page(
@@ -631,6 +689,7 @@ def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: 
         tmp,
         0,
         clip=pymupdf.Rect(0, 0, PAGE_W, HEADER_SRC_H),
+        keep_proportion=False,
     )
     page.show_pdf_page(
         pymupdf.Rect(0, FOOTER_Y, PAGE_W, PAGE_H),
@@ -646,21 +705,7 @@ def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: 
         width=0,
     )
     page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
-    if not odd:
-        font_b = pymupdf.Font(fontfile=FONT_BOLD)
-        badge_x0 = 104.88
-        gap = 8.0
-        right = badge_x0 - gap
-        size = 6.2
-        for text, baseline in (("ПРОВЕРЕНО", 21.6), ("КАЧЕСТВОМ", 28.8)):
-            tw = font_b.text_length(text, fontsize=size)
-            page.insert_text(
-                (right - tw, baseline),
-                text,
-                fontname="segoeb",
-                fontsize=size,
-                color=WHITE,
-            )
+    _draw_header_type(page, odd)
     x, y = _PAGE_NUM_POS[odd]
     if odd:
         page.draw_rect(
@@ -971,12 +1016,9 @@ def draw_card(
         return
 
     rows = (n + 1) // 2 if n >= 2 else n
-    min_img = max(52.0, free.height * 0.30)
-    table_h = min(
-        head_h + rows * row_h,
-        max(head_h + 9.0, free.height - min_img - 3),
-    )
-    img_h = max(40.0, free.height - table_h - 3)
+    table_h = min(head_h + rows * row_h, max(head_h + 9.0, free.height - 40.0))
+    # Photo no taller than one grid cell, even if the stacked card has leftover room.
+    img_h = min(CELL_H, max(40.0, free.height - table_h - 3))
     img_rect = pymupdf.Rect(free.x0 + 10, free.y0, free.x1 - 10, free.y0 + img_h)
     _place_image(page, image_png, img_rect)
     table = pymupdf.Rect(free.x0, img_rect.y1 + 3, free.x1, free.y1)
