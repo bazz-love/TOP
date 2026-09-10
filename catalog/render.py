@@ -582,6 +582,82 @@ def _split_core_and_attrs_sku(p: Product) -> tuple[str, dict]:
     return core, attrs
 
 
+SUBTITLE = (115 / 255, 95 / 255, 99 / 255)
+DARK_PANEL = (0.12, 0.12, 0.125)
+
+
+def _draw_header_type(page: pymupdf.Page, odd: bool):
+    """Re-set header type at real metrics — the v12 clip is only scaled in Y."""
+    page.insert_font(fontname="segoe", fontfile=FONT_REG)
+    page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    font_b = pymupdf.Font(fontfile=FONT_BOLD)
+    font_r = pymupdf.Font(fontfile=FONT_REG)
+    title_size = 13.5
+    sub_size = 5.8
+    cat = "КАТАЛОГ "
+    tov = "ТОВАРОВ"
+    sub = "ПРОФЕССИОНАЛЬНЫЙ ИНСТРУМЕНТ И ОСНАСТКА"
+    cat_w = font_b.text_length(cat, fontsize=title_size)
+    tov_w = font_b.text_length(tov, fontsize=title_size)
+    sub_w = font_r.text_length(sub, fontsize=sub_size)
+    title_y = 22.2
+    sub_y = 32.4
+    if odd:
+        x = 168.94
+        page.draw_rect(
+            pymupdf.Rect(155.0, 8.0, 400.0, 36.5),
+            color=WHITE,
+            fill=WHITE,
+            width=0,
+        )
+        sub_x = x
+    else:
+        x = 426.33 - cat_w - tov_w
+        page.draw_rect(
+            pymupdf.Rect(200.0, 8.0, 440.0, 36.5),
+            color=WHITE,
+            fill=WHITE,
+            width=0,
+        )
+        sub_x = x + cat_w + tov_w - sub_w
+    page.insert_text((x, title_y), cat, fontname="segoeb", fontsize=title_size, color=INK)
+    page.insert_text(
+        (x + cat_w, title_y), tov, fontname="segoeb", fontsize=title_size, color=ORANGE
+    )
+    page.insert_text(
+        (sub_x, sub_y), sub, fontname="segoe", fontsize=sub_size, color=SUBTITLE
+    )
+
+    cap_size = 6.2
+    if odd:
+        page.draw_rect(
+            pymupdf.Rect(486.0, 16.0, 550.0, 34.5),
+            color=DARK_PANEL,
+            fill=DARK_PANEL,
+            width=0,
+        )
+        for text, baseline in (("ПРОВЕРЕНО", 21.6), ("КАЧЕСТВОМ", 28.8)):
+            page.insert_text(
+                (493.23, baseline),
+                text,
+                fontname="segoeb",
+                fontsize=cap_size,
+                color=WHITE,
+            )
+    else:
+        badge_x0 = 104.88
+        right = badge_x0 - 8.0
+        for text, baseline in (("ПРОВЕРЕНО", 21.6), ("КАЧЕСТВОМ", 28.8)):
+            tw = font_b.text_length(text, fontsize=cap_size)
+            page.insert_text(
+                (right - tw, baseline),
+                text,
+                fontname="segoeb",
+                fontsize=cap_size,
+                color=WHITE,
+            )
+
+
 def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: str):
     """Copy v12 chrome: header stays full page width, height matches the footer."""
     tmpl = 0 if odd else 1
@@ -589,11 +665,23 @@ def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: 
     tmp.insert_pdf(src, from_page=tmpl, to_page=tmpl)
     if odd:
         tmp[0].add_redact_annot(pymupdf.Rect(554.0, 809.5, 577.0, 829.5), fill=ORANGE)
+        tmp[0].add_redact_annot(
+            pymupdf.Rect(488.0, 36.0, 548.0, 62.0),
+            fill=DARK_PANEL,
+        )
+        tmp[0].add_redact_annot(
+            pymupdf.Rect(160.0, 24.0, 390.0, 64.0),
+            fill=WHITE,
+        )
     else:
         tmp[0].add_redact_annot(pymupdf.Rect(18.5, 809.5, 41.5, 829.5), fill=ORANGE)
         tmp[0].add_redact_annot(
             pymupdf.Rect(16.0, 38.0, 68.5, 60.0),
-            fill=(0.12, 0.12, 0.125),
+            fill=DARK_PANEL,
+        )
+        tmp[0].add_redact_annot(
+            pymupdf.Rect(205.0, 24.0, 435.0, 64.0),
+            fill=WHITE,
         )
     tmp[0].apply_redactions(images=0)
     page.show_pdf_page(
@@ -617,21 +705,7 @@ def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: 
         width=0,
     )
     page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
-    if not odd:
-        font_b = pymupdf.Font(fontfile=FONT_BOLD)
-        badge_x0 = 104.88
-        gap = 8.0
-        right = badge_x0 - gap
-        size = 6.2
-        for text, baseline in (("ПРОВЕРЕНО", 21.6), ("КАЧЕСТВОМ", 28.8)):
-            tw = font_b.text_length(text, fontsize=size)
-            page.insert_text(
-                (right - tw, baseline),
-                text,
-                fontname="segoeb",
-                fontsize=size,
-                color=WHITE,
-            )
+    _draw_header_type(page, odd)
     x, y = _PAGE_NUM_POS[odd]
     if odd:
         page.draw_rect(
