@@ -218,24 +218,31 @@ def _wrap(font: pymupdf.Font, text: str, size: float, max_w: float) -> list[str]
 
 
 def _sort_variants(products: list[Product]) -> list[Product]:
-    def nums(val) -> tuple:
-        if not val:
-            return (0.0,)
-        token = val[-1] if isinstance(val, tuple) else val
-        found = [float(x.replace(",", ".")) for x in re.findall(r"\d+(?:[.,]\d+)?", token)]
-        return tuple(found) or (0.0,)
-
-    def key(p: Product):
+    def dia_key(p: Product) -> tuple:
         _, attrs = _split_core_and_attrs(p.name)
-        return (
-            nums(attrs.get("sizes")),
-            nums(attrs.get("vol")),
-            nums(attrs.get("grit")),
-            nums(attrs.get("teeth")),
-            p.sku,
-        )
+        dias = attrs.get("set_dias") or ()
+        if dias:
+            return (_num(dias[0]), 0.0, p.sku)
+        sizes = attrs.get("sizes") or ()
+        if sizes:
+            parts = _size_parts_list(sizes[0])
+            d = _num(parts[0]) if parts else 0.0
+            ln = _num(parts[1]) if len(parts) > 1 else 0.0
+            return (d, ln, p.sku)
+        grit = attrs.get("grit") or ()
+        if grit:
+            return (_num(grit[0]), 0.0, p.sku)
+        vol = attrs.get("vol") or ()
+        if vol:
+            return (_num(vol[0]), 0.0, p.sku)
+        return (0.0, 0.0, p.sku)
 
-    return sorted(products, key=key)
+    return sorted(products, key=dia_key)
+
+
+def _num(token: str) -> float:
+    found = re.findall(r"\d+(?:[.,]\d+)?", str(token).replace(" ", ""))
+    return float(found[0].replace(",", ".")) if found else 0.0
 
 
 PACK_RE = re.compile(r"\s+\d+\s*/\s*\d+\s*$")
@@ -276,6 +283,20 @@ SDS_PAIR_RE = re.compile(
 )
 CX_DIA_RE = re.compile(r"ЦХ\s+(\d+(?:[.,]\d+)?)(?!\s*мм)\b", re.I)
 D_DIA_RE = re.compile(r"\bd\s*(\d+(?:[.,]\d+)?)\b", re.I)
+SET_COMMA_RE = re.compile(
+    r"\(?\s*((?:\d+\s*,\s*){2,}\d+)\s*мм\s*\)?",
+    re.I,
+)
+SET_CHAIN_RE = re.compile(
+    r"\(?(\d+(?:-\d+){2,})(?:\s*[xх*×]\s*(\d+))?\)?",
+)
+SET_SPACE_RE = re.compile(
+    r"\(?\s*((?:\d+\s+){2,}\d+)\s*мм\s*\)?",
+    re.I,
+)
+SHANK_RE = re.compile(r"хв\.?\s*\d+(?:[.,]\d+)?\s*мм", re.I)
+TRI_SHANK_RE = re.compile(r"\d\s*[-–]?\s*гр\.?\s*хвост", re.I)
+L_PAIR_RE = re.compile(r"\bL\s*(\d+)\s*/\s*(\d+)", re.I)
 GRIT_RE = re.compile(
     r"(?:(?:\b[PРpр]\s*)|(?:\bзерно\s+))(\d+(?:\s*/\s*\d+)?)\b",
     re.I,
@@ -314,6 +335,7 @@ def _normalize_name(name: str) -> str:
     s = re.sub(r"\s*\)", ")", s)
     s = re.sub(r";\s*", "; ", s)
     s = re.sub(r"мм\s*[xх*]", "×", s, flags=re.I)
+    s = re.sub(r"\bдер\.\s*", "дереву ", s, flags=re.I)
     prev = None
     while prev != s:
         prev = s
@@ -337,6 +359,27 @@ def _norm_measure(z: str) -> str:
 def _split_core_and_attrs(name: str) -> tuple[str, dict]:
     s = PACK_RE.sub("", _normalize_name(name)).strip()
     attrs: dict = {}
+    mset = SET_COMMA_RE.search(s)
+    if mset:
+        attrs["set_dias"] = tuple(x.strip() for x in mset.group(1).split(",") if x.strip())
+        s = SET_COMMA_RE.sub(" ", s)
+    mchain = SET_CHAIN_RE.search(s)
+    if mchain:
+        attrs["set_dias"] = tuple(mchain.group(1).split("-"))
+        if mchain.group(2):
+            attrs["shared_len"] = _norm_measure(mchain.group(2) + " мм")
+        s = SET_CHAIN_RE.sub(" ", s)
+    if not attrs.get("set_dias"):
+        mspace = SET_SPACE_RE.search(s)
+        if mspace:
+            attrs["set_dias"] = tuple(mspace.group(1).split())
+            s = SET_SPACE_RE.sub(" ", s)
+    s = SHANK_RE.sub(" ", s)
+    s = TRI_SHANK_RE.sub("хвост", s)
+    lp = L_PAIR_RE.search(s)
+    if lp:
+        attrs["L"] = f"{lp.group(1)}/{lp.group(2)}"
+        s = L_PAIR_RE.sub(" ", s)
     if THREAD_RANGE_RE.search(s):
         tm = THREAD_RANGE_RE.search(s)
         attrs["thread_range"] = f"М{tm.group(1)}–М{tm.group(2)}"
@@ -428,6 +471,7 @@ def _split_core_and_attrs(name: str) -> tuple[str, dict]:
     s = BOX_RE.sub(" ", s)
     s = re.sub(r"\s*\*\s*", " ", s)
     s = re.sub(r"[\(\);,]+", " ", s)
+    s = _strip_core_noise(s, name)
     s = re.sub(r"\s+", " ", s).strip(" ,;.")
     return s, attrs
 
@@ -440,41 +484,110 @@ def _tidy_title(title: str) -> str:
     title = title.strip(" ,;.×")
     title = re.sub(r"\s+(по|с|и|для|из)$", "", title, flags=re.I)
     title = title.replace("камню кирпичу", "камню, кирпичу")
+    title = title.replace("стеклу керамике", "стеклу, керамике")
+    title = re.sub(r"/\s*(?=[А-Яа-яЁё])", " / ", title)
+    title = re.sub(r'\s*"+', " ", title)
+    title = re.sub(r",\s*,+", ",", title)
+    title = re.sub(r"\s+", " ", title)
     if title and title[0].islower():
         title = title[0].upper() + title[1:]
     return title.strip(" ,;.")
 
 
+def _word_key(token: str) -> str:
+    return re.sub(r"[«»\"'.,;:]+", "", token).lower()
+
+
 def _common_title(products: list[Product]) -> str:
     cores = [_split_core_and_attrs(p.name)[0] for p in products]
     if len(products) == 1:
-        return _tidy_title(cores[0])
-    word_lists = [c.split() for c in cores]
-    prefix: list[str] = []
-    for toks in zip(*word_lists):
-        if len({t.lower() for t in toks}) == 1:
-            prefix.append(toks[0])
-        else:
-            break
-    title = " ".join(prefix).strip(" ,;")
-    prefix_keys = {t.lower() for t in prefix}
-    shared_rest: list[str] = []
-    for w in word_lists[0]:
-        key = w.lower()
-        if key in prefix_keys:
-            continue
-        if all(key in {t.lower() for t in wl} for wl in word_lists):
-            shared_rest.append(w)
-            prefix_keys.add(key)
-    if shared_rest:
-        title = " ".join(prefix + shared_rest).strip(" ,;")
-    if len(title) < 8:
-        title = min(cores, key=len)
-    hards = {a.get("hardness") for a in (_split_core_and_attrs(p.name)[1] for p in products)}
-    if len(hards) == 1:
-        hard = next(iter(hards))
-        if hard:
-            title = f"{title} {hard}"
+        title = cores[0]
+    else:
+        word_lists = [c.split() for c in cores]
+        prefix: list[str] = []
+        for toks in zip(*word_lists):
+            if len({_word_key(t) for t in toks}) == 1:
+                prefix.append(toks[0])
+            else:
+                break
+        title = " ".join(prefix).strip(" ,;")
+        prefix_keys = {_word_key(t) for t in prefix}
+        shared_rest: list[str] = []
+        for w in word_lists[0]:
+            key = _word_key(w)
+            if not key or key in prefix_keys:
+                continue
+            if all(key in {_word_key(t) for t in wl} for wl in word_lists):
+                shared_rest.append(w)
+                prefix_keys.add(key)
+        if shared_rest:
+            title = " ".join(prefix + shared_rest).strip(" ,;")
+        if len(title) < 8:
+            title = min(cores, key=len)
+        hards = {
+            a.get("hardness")
+            for a in (_split_core_and_attrs(p.name)[1] for p in products)
+        }
+        if len(hards) == 1:
+            hard = next(iter(hards))
+            if hard:
+                title = f"{title} {hard}"
+    title = _tidy_title(title)
+    if products and _is_metal_drill(products[0].name):
+        for q in _metal_quals(products):
+            q_cmp = q.lower().replace("(tin)", "").strip()
+            if q_cmp and q_cmp in title.lower():
+                continue
+            if q.lower() in title.lower():
+                continue
+            if "ступенчат" in title.lower():
+                title = f"{title} {q}"
+            else:
+                titled, nsub = re.subn(
+                    r"(Сверло по металлу)",
+                    r"\1 " + q,
+                    title,
+                    count=1,
+                    flags=re.I,
+                )
+                title = titled if nsub else f"{title} {q}"
+    shared_len = None
+    if products:
+        slens = {
+            _split_core_and_attrs(p.name)[1].get("shared_len") for p in products
+        }
+        slens.discard(None)
+        if len(slens) == 1:
+            shared_len = next(iter(slens))
+        elif _is_spade_drill(products[0].name) or (
+            _is_drill_set(products[0].name) and "перов" in products[0].name.lower()
+        ):
+            shared_len = _shared_compound_length(products)
+        if not shared_len and (
+            _is_drill_set(products[0].name) or _is_spade_drill(products[0].name)
+        ):
+            _, a0 = _split_core_and_attrs(products[0].name)
+            for s in a0.get("sizes") or ():
+                parts = _size_parts_list(s)
+                if len(parts) == 1:
+                    try:
+                        n = float(parts[0].replace(",", "."))
+                    except ValueError:
+                        continue
+                    if n >= 80 and all(
+                        any(
+                            len(_size_parts_list(z)) == 1
+                            and _size_parts_list(z)[0] == parts[0]
+                            for z in (
+                                _split_core_and_attrs(p.name)[1].get("sizes") or ()
+                            )
+                        )
+                        for p in products
+                    ):
+                        shared_len = _format_size_parts(parts)
+                        break
+    if shared_len and shared_len not in title:
+        title = f"{title} {shared_len}"
     return _tidy_title(title)
 
 
@@ -549,10 +662,131 @@ def _type_sizes(sizes: tuple[str, ...] | None) -> list[str]:
             continue
         m = re.search(r"(\d+(?:[.,]\d+)?)", s)
         num = float(m.group(1).replace(",", ".")) if m else 999
-        if num < 2 and "×" not in s:
+        if num < 2 and "×" not in s and not re.search(r"[-–]", s):
             continue
         kept.append(_strip_bore_in_size(s))
     return kept or list(sizes)
+
+
+def _format_dia_list(dias: tuple[str, ...] | list[str]) -> str:
+    return ", ".join(dias) + " мм"
+
+
+def _is_drill_set(name: str) -> bool:
+    n = name.lower()
+    if "удлинител" in n or "установк" in n or "замок" in n or "замков" in n:
+        return False
+    return bool(re.search(r"набор(?:\s+ударных)?\s+сверл", n))
+
+
+def _is_step_set(name: str) -> bool:
+    n = name.lower()
+    return "набор" in n and "ступенчат" in n
+
+
+def _is_metal_drill(name: str) -> bool:
+    n = name.lower()
+    return bool(re.search(r"сверл[оа].*металл", n)) and "набор" not in n
+
+
+def _is_spade_drill(name: str) -> bool:
+    n = name.lower()
+    if "набор" in n or "удлинител" in n:
+        return False
+    return n.lstrip().startswith("сверл") and "перов" in n
+
+
+def _strip_core_noise(s: str, orig: str) -> str:
+    """Drop steel codes and English series tags that belong in quals/type."""
+    if not (
+        _is_metal_drill(orig)
+        or _is_spade_drill(orig)
+        or _is_drill_set(orig)
+        or _is_step_set(orig)
+        or re.search(r"ступенчат", orig, re.I)
+    ):
+        return s
+    s = re.sub(r"\bHSS(?:-[A-Za-z]+)+\b", " ", s, flags=re.I)
+    s = re.sub(r"\bHSS\b", " ", s, flags=re.I)
+    s = re.sub(r"\bP[56]M5(?:K5|R5)?\b", " ", s, flags=re.I)
+    s = re.sub(r"\bDYNAMIC(?:-TIN)?\b", " ", s, flags=re.I)
+    s = re.sub(r"\bDINAMYC-TIN\b", " ", s, flags=re.I)
+    s = re.sub(r"\bDINAMIC\b", " ", s, flags=re.I)
+    s = re.sub(r"\bLONG\b", " ", s, flags=re.I)
+    s = re.sub(r"\bCOBALT(?:\s+CARD)?\b", " ", s, flags=re.I)
+    s = re.sub(r"\bTIN\b", " ", s, flags=re.I)
+    s = re.sub(r"\bCARD\b", " ", s, flags=re.I)
+    s = re.sub(r"угол\s+заточки\s+\d+\s*\*?", " ", s, flags=re.I)
+    s = re.sub(r",?\s*\b118\b", " ", s)
+    s = re.sub(r"\bExtreme\b", " ", s, flags=re.I)
+    s = re.sub(r"\b\d+\s*%", " ", s)
+    s = re.sub(r"\d+\s*ступен(?:ей|и|я)?", " ", s, flags=re.I)
+    if _is_metal_drill(orig):
+        s = re.sub(r"\bхвост\b", " ", s, flags=re.I)
+        s = re.sub(r"\bd\b", " ", s, flags=re.I)
+    if _is_spade_drill(orig) or _is_drill_set(orig):
+        s = re.sub(r"\bHEX\b", " ", s, flags=re.I)
+        s = re.sub(r"\bхвостовик\b", " ", s, flags=re.I)
+    if re.search(r"ступенчат", orig, re.I):
+        s = re.sub(r"\bшаг\b", " ", s, flags=re.I)
+        s = re.sub(r"\bцилиндр\.?\b", " ", s, flags=re.I)
+        s = re.sub(r"\bхвостовик\b", " ", s, flags=re.I)
+    if _is_drill_set(orig) or _is_step_set(orig):
+        s = re.sub(r"\bцилиндр\.?\b", " ", s, flags=re.I)
+        s = re.sub(r"\bхвостовик\b", " ", s, flags=re.I)
+    return s
+
+
+def _size_as_range(size: str) -> str | None:
+    """4×10 / 4*12 → 4-10 when it is a diameter span, not dia×length."""
+    parts = _size_parts_list(size)
+    if len(parts) != 2:
+        body = re.sub(r"\s*мм$", "", size, flags=re.I).replace("–", "-")
+        if re.match(r"^\d+(?:[.,]\d+)?-\d+(?:[.,]\d+)?$", body):
+            return f"{body} мм"
+        return None
+    try:
+        a = float(parts[0].replace(",", "."))
+        b = float(parts[1].replace(",", "."))
+    except ValueError:
+        return None
+    if a < b:
+        return f"{parts[0]}-{parts[1]}"
+    return None
+
+
+def _metal_quals(products: list[Product]) -> list[str]:
+    if not products or not _is_metal_drill(products[0].name):
+        return []
+    n = len(products)
+    need = n if n <= 2 else max(2, n - 1)
+    checks = (
+        (r"удлиненн|\bLONG\b|DYNAMIC(?!\s*-?\s*TIN)|DINAMIC\s+LONG", "удлиненное"),
+        (r"COBALT|HSS-Co|HSS-G-Co|кобальт", "кобальтовое"),
+        (r"HSS-TIN|DYNAMIC-TIN|-TIN\b|титанов", "титановое (TIN)"),
+    )
+    out: list[str] = []
+    for pat, label in checks:
+        hits = sum(1 for p in products if re.search(pat, p.name, re.I))
+        if hits >= need:
+            out.append(label)
+    return out
+
+
+def _shared_compound_length(products: list[Product]) -> str | None:
+    lengths: list[str] = []
+    for p in products:
+        _, attrs = _split_core_and_attrs(p.name)
+        sizes = attrs.get("sizes") or ()
+        if not sizes:
+            return None
+        parts = _size_parts_list(sizes[0])
+        if len(parts) < 2:
+            return None
+        lengths.append(parts[1])
+    if lengths and len(set(lengths)) == 1:
+        return _format_size_parts([lengths[0]])
+    return None
 
 
 _SKIP_LEFTOVER = {
@@ -589,7 +823,55 @@ def _arbor_bits(attrs: dict) -> tuple[str, ...]:
 
 def _spec_bits(attrs: dict, name: str = "") -> list[str]:
     bits: list[str] = []
-    bits.extend(_type_sizes(attrs.get("sizes")))
+    if attrs.get("set_dias"):
+        bits.append(_format_dia_list(attrs["set_dias"]))
+        return bits
+    sizes = list(attrs.get("sizes") or ())
+    if _is_drill_set(name) or _is_step_set(name):
+        ranges = []
+        rest = []
+        for s in sizes:
+            rng = _size_as_range(s)
+            if rng:
+                parts = _size_parts_list(s)
+                if len(parts) == 2:
+                    b = _num(parts[1])
+                    if _is_step_set(name) or b <= 16:
+                        ranges.append(re.sub(r"\s*мм$", "", rng, flags=re.I))
+                        continue
+                elif re.search(r"\d.+\d", rng):
+                    ranges.append(re.sub(r"\s*мм$", "", rng, flags=re.I))
+                    continue
+            rest.append(s)
+        if ranges:
+            bits.append(", ".join(ranges) + " мм")
+            sizes = rest
+        sizes = [
+            s
+            for s in sizes
+            if not (
+                len(_size_parts_list(s)) == 1 and _num(_size_parts_list(s)[0]) >= 80
+            )
+        ]
+        bits.extend(_type_sizes(tuple(sizes) if sizes else None))
+        if not bits:
+            bits.extend(attrs.get("count") or ())
+        return bits
+    if _is_spade_drill(name) and sizes:
+        parts = _size_parts_list(sizes[0])
+        if parts:
+            bits.append(_format_size_parts([parts[0]]))
+        return bits
+    if _is_metal_drill(name) and sizes:
+        bits.append(_strip_bore_in_size(sizes[0]))
+        if attrs.get("L") and "×" not in bits[-1]:
+            bits.append(attrs["L"])
+        return bits
+    if _is_metal_drill(name) and attrs.get("L") and not sizes:
+        if attrs.get("L"):
+            bits.append(attrs["L"])
+        return bits
+    bits.extend(_type_sizes(tuple(sizes) if sizes else None))
     bits.extend(attrs.get("vol") or ())
     bits.extend(attrs.get("inch") or ())
     if attrs.get("thread_range"):
@@ -609,6 +891,8 @@ def _spec_bits(attrs: dict, name: str = "") -> list[str]:
         bits.append(attrs["thread"])
     if not bits:
         bits.extend(attrs.get("count") or ())
+    if attrs.get("L") and not bits:
+        bits.append(attrs["L"])
     return bits
 
 
@@ -621,6 +905,14 @@ def _material_bit(name: str) -> str | None:
 
 def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
     mine_core, mine = _split_core_and_attrs_sku(p)
+    if (
+        _is_metal_drill(p.name)
+        or _is_drill_set(p.name)
+        or _is_step_set(p.name)
+        or _is_spade_drill(p.name)
+    ):
+        bits = _spec_bits(mine, p.name)
+        return ", ".join(bits) if bits else "—"
     if len(siblings) == 1:
         bits = _spec_bits(mine, p.name)
         if not bits:
