@@ -1386,6 +1386,7 @@ def _draw_variant_table(
     y += head_h
     for i, (p, lab) in enumerate(zip(products, labels)):
         shown = lab
+        name_size = 6.6
         if font_r.text_length(lab, fontsize=name_size) > name_w:
             name_size = max(
                 4.6,
