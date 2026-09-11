@@ -334,7 +334,7 @@ def _normalize_name(name: str) -> str:
     s = re.sub(r"\(\s*", "(", s)
     s = re.sub(r"\s*\)", ")", s)
     s = re.sub(r";\s*", "; ", s)
-    s = re.sub(r"мм\s*[xх*]", "×", s, flags=re.I)
+    s = re.sub(r"мм\s*[xх*]\s*(?=\d)", "×", s, flags=re.I)
     s = re.sub(r"\bдер\.\s*", "дереву ", s, flags=re.I)
     prev = None
     while prev != s:
@@ -962,7 +962,11 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
         if not bits:
             bits.extend(extra)
         else:
-            bits.extend(w for w in extra if w.lower() in {"тонкая", "сегмент", "турбо"})
+            bits.extend(
+                w
+                for w in extra
+                if w.lower() in {"тонкая", "сегмент", "турбо", "sds+", "шестигранный"}
+            )
     if not bits:
         count_vals = [a.get("count") for a in all_attrs]
         if len(set(count_vals)) > 1 and mine.get("count"):
@@ -1381,18 +1385,14 @@ def _draw_variant_table(
     _draw_col_headers(page, font_r, y, name_x, sku_left, price_left)
     y += head_h
     for i, (p, lab) in enumerate(zip(products, labels)):
-        name_size = 6.6
-        if _is_saw(p.name):
-            shown = lab
-            if font_r.text_length(lab, fontsize=name_size) > name_w:
-                name_size = max(
-                    5.6,
-                    name_size
-                    * name_w
-                    / max(1.0, font_r.text_length(lab, fontsize=name_size)),
-                )
-        else:
-            shown = _wrap(font_r, lab, name_size, name_w)[0]
+        shown = lab
+        if font_r.text_length(lab, fontsize=name_size) > name_w:
+            name_size = max(
+                4.6,
+                name_size
+                * name_w
+                / max(1.0, font_r.text_length(lab, fontsize=name_size)),
+            )
         _draw_text_row(
             page, font_r, y, name_x, sku_r, price_r, shown, p.sku, p.price, name_size
         )
