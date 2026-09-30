@@ -3,17 +3,24 @@
 
 from pathlib import Path
 
-from catalog.parse_price import parse_price
+from catalog.parse_price import (
+    apply_excel_photo_overrides,
+    attach_pdf_images,
+    parse_excel,
+)
 from catalog.render import remaining_lines, render_new_pages
 
 ROOT = Path(__file__).resolve().parents[1]
+EXCEL = ROOT / "TOP Excel до Лезвий.xlsx"
 PRICE = ROOT / "Прайс ТОП до ЛЕЗВИЙ.pdf"
 SRC = ROOT / "katalog_v12.pdf"
 OUT = ROOT / "katalog_v13.pdf"
 
 
 def main() -> None:
-    lines = parse_price(PRICE)
+    lines = parse_excel(EXCEL)
+    attach_pdf_images(lines, PRICE)
+    apply_excel_photo_overrides(lines, EXCEL)
     rest = remaining_lines(lines)
     pages = render_new_pages(SRC, PRICE, lines, OUT)
     print(f"wrote {OUT}  ({len(pages)} pages)")

@@ -170,6 +170,11 @@ def _trim_white(png: bytes) -> bytes:
 
 
 def extract_image(price_doc: pymupdf.Document, line: ProductLine) -> bytes | None:
+    if line.image_png:
+        try:
+            return _trim_white(line.image_png)
+        except Exception:
+            return line.image_png
     if line.image_xref is None or line.image_page is None:
         return None
     try:
@@ -1515,7 +1520,7 @@ def render_new_pages(
     pages = place_pages(remaining_lines(lines), n_new)
     font_r = pymupdf.Font(fontfile=FONT_REG)
     font_b = pymupdf.Font(fontfile=FONT_BOLD)
-    img_cache: dict[tuple[int | None, int | None], bytes | None] = {}
+    img_cache: dict[tuple, bytes | None] = {}
 
     start_num = 1
     for i, placed_list in enumerate(pages):
@@ -1543,10 +1548,15 @@ def render_new_pages(
                 idx = j + 1
 
         for pl in placed_list:
-            key = (pl.line.image_page, pl.line.image_xref)
-            if key not in img_cache:
-                img_cache[key] = extract_image(price, pl.line)
-            draw_card(page, pl, img_cache[key], font_r, font_b)
+            if pl.line.image_png:
+                img_cache[("xlsx", pl.line.excel_row)] = extract_image(price, pl.line)
+                png = img_cache[("xlsx", pl.line.excel_row)]
+            else:
+                key = (pl.line.image_page, pl.line.image_xref)
+                if key not in img_cache:
+                    img_cache[key] = extract_image(price, pl.line)
+                png = img_cache[key]
+            draw_card(page, pl, png, font_r, font_b)
 
     out.save(out_path, deflate=True, garbage=4)
     out.close()
