@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import re
+import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 import pymupdf
 
@@ -103,6 +106,8 @@ class ProductLine:
     products: list[Product] = field(default_factory=list)
     image_xref: int | None = None
     image_page: int | None = None
+    image_png: bytes | None = None
+    excel_row: int | None = None
 
     @property
     def slots(self) -> int:
@@ -264,6 +269,153 @@ def parse_price(pdf_path: str | Path) -> list[ProductLine]:
                 if "«РОСОМАХА»" not in p.name:
                     p.name = (p.name + " «РОСОМАХА»").strip()
     return [ln for ln in lines if ln.products]
+
+
+def format_excel_price(value) -> str:
+    if isinstance(value, (int, float)):
+        s = f"{float(value):.2f}".replace(".", ",")
+        whole, frac = s.split(",")
+        if len(whole) > 3:
+            parts: list[str] = []
+            while whole:
+                parts.append(whole[-3:])
+                whole = whole[:-3]
+            whole = " ".join(reversed(parts))
+        return f"{whole},{frac}"
+    text = str(value).strip()
+    return text
+
+
+def _excel_images_by_row(xlsx_path: str | Path) -> dict[int, bytes]:
+    """Map 1-based Excel row of a 12345 photo cell to PNG bytes."""
+    z = zipfile.ZipFile(xlsx_path)
+    rel_xml = z.read("xl/drawings/_rels/drawing1.xml.rels").decode()
+    rels = dict(re.findall(r'Id="(rId\d+)"[^>]*Target="([^"]+)"', rel_xml))
+    draw = z.read("xl/drawings/drawing1.xml")
+    if draw.startswith(b"\xef\xbb\xbf"):
+        draw = draw[3:]
+    root = ET.fromstring(draw)
+
+    def local(tag: str) -> str:
+        return tag.split("}")[-1] if "}" in tag else tag
+
+    out: dict[int, bytes] = {}
+    for child in list(root):
+        if local(child.tag) != "twoCellAnchor":
+            continue
+        frm = None
+        embed = None
+        for el in child.iter():
+            if local(el.tag) == "from":
+                for sub in el:
+                    if local(sub.tag) == "row" and frm is None:
+                        frm = int(sub.text)
+            if local(el.tag) == "blip":
+                embed = el.attrib.get(
+                    "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+                )
+        if frm is None or not embed:
+            continue
+        target = rels.get(embed)
+        if not target:
+            continue
+        data = z.read("xl/media/" + Path(target).name)
+        out[frm + 1] = data
+    return out
+
+
+def parse_excel(xlsx_path: str | Path) -> list[ProductLine]:
+    """Read the 1C Excel price: one product line per 12345 photo group."""
+    from openpyxl import load_workbook
+
+    wb = load_workbook(xlsx_path, data_only=True)
+    ws = wb.active
+    skip_sku = {"код", "kod", "sku", "артикул"}
+    skip_name = {"номенклатура", "наименование"}
+    lines: list[ProductLine] = []
+    current: ProductLine | None = None
+    current_cat = ("", "")
+    for r in range(1, (ws.max_row or 0) + 1):
+        a = str(ws.cell(r, 1).value or "").strip()
+        name_raw = str(ws.cell(r, 6).value or "").strip()
+        sku_raw = str(ws.cell(r, 14).value or "").strip()
+        sku = latinize_sku(sku_raw)
+        price_val = ws.cell(r, 15).value
+        cat_m = CAT_RE.match(a)
+        if cat_m:
+            current_cat = (cat_m.group(1), cat_m.group(2).strip())
+            current = None
+            continue
+        if a.replace(" ", "") == "12345":
+            current = ProductLine(
+                category_code=current_cat[0],
+                category_name=current_cat[1],
+                excel_row=r,
+            )
+            lines.append(current)
+        if not name_raw or not sku:
+            continue
+        if sku.lower() in skip_sku or name_raw.lower() in skip_name:
+            continue
+        if current is None:
+            current = ProductLine(
+                category_code=current_cat[0],
+                category_name=current_cat[1],
+                excel_row=r,
+            )
+            lines.append(current)
+        name = clean_name(name_raw, sku)
+        current.products.append(
+            Product(
+                name=name,
+                sku=sku,
+                price=format_excel_price(price_val),
+                category_code=current.category_code,
+                category_name=current.category_name,
+            )
+        )
+    for ln in lines:
+        if any("«РОСОМАХА»" in p.name for p in ln.products):
+            for p in ln.products:
+                if "«РОСОМАХА»" not in p.name:
+                    p.name = (p.name + " «РОСОМАХА»").strip()
+    return [ln for ln in lines if ln.products]
+
+
+def attach_pdf_images(lines: list[ProductLine], pdf_path: str | Path) -> None:
+    """Keep catalog photos from the 1C PDF, matched by SKU to Excel groups."""
+    pdf_lines = parse_price(pdf_path)
+    sku_img: dict[str, tuple[int | None, int | None]] = {}
+    for ln in pdf_lines:
+        key = (ln.image_page, ln.image_xref)
+        for p in ln.products:
+            sku_img[p.sku] = key
+    for ln in lines:
+        hits = [sku_img[p.sku] for p in ln.products if p.sku in sku_img]
+        if not hits:
+            continue
+        page, xref = Counter(hits).most_common(1)[0][0]
+        ln.image_page = page
+        ln.image_xref = xref
+        for p in ln.products:
+            p.image_page = page
+            p.image_xref = xref
+
+
+def apply_excel_photo_overrides(lines: list[ProductLine], xlsx_path: str | Path) -> None:
+    """One Excel photo: ROSOMAKHA cutting discs for metal and stainless."""
+    images = _excel_images_by_row(xlsx_path)
+    for ln in lines:
+        blob = " ".join(p.name for p in ln.products).lower()
+        if not (
+            "отрезн" in blob
+            and "нержавеющ" in blob
+            and "росомах" in blob
+        ):
+            continue
+        png = images.get(ln.excel_row or -1)
+        if png:
+            ln.image_png = png
 
 
 if __name__ == "__main__":
