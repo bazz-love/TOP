@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
-"""Build the next catalog pages from the TOP price list."""
+"""Build catalog pages from Excel parts 1 and 2."""
 
 from pathlib import Path
 
 from catalog.parse_price import (
     apply_excel_photo_overrides,
     attach_pdf_images,
-    parse_excel,
+    parse_excels,
 )
 from catalog.render import remaining_lines, render_new_pages
 
 ROOT = Path(__file__).resolve().parents[1]
-EXCEL = ROOT / "TOP Excel до Лезвий.xlsx"
+EXCELS = [ROOT / "1.xlsx", ROOT / "2.xlsx"]
 PRICE = ROOT / "Прайс ТОП до ЛЕЗВИЙ.pdf"
 SRC = ROOT / "katalog_v12.pdf"
+if not SRC.exists():
+    SRC = ROOT / "katalog_v13.pdf"
 OUT = ROOT / "katalog_v13.pdf"
 
 
 def main() -> None:
-    lines = parse_excel(EXCEL)
+    lines = parse_excels(EXCELS)
     attach_pdf_images(lines, PRICE)
-    apply_excel_photo_overrides(lines, EXCEL)
+    apply_excel_photo_overrides(lines)
     rest = remaining_lines(lines)
     pages = render_new_pages(SRC, PRICE, lines, OUT)
     print(f"wrote {OUT}  ({len(pages)} pages)")
