@@ -1067,9 +1067,15 @@ def _draw_header_type(
             )
 
 
-def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: str):
+def _stamp_chrome(
+    page: pymupdf.Page,
+    src: pymupdf.Document,
+    odd: bool,
+    number: str,
+    header_src_h: float = HEADER_SRC_H,
+):
     """Short full-width header: side art keeps proportion, title is re-set."""
-    tmpl = 0 if odd else 1
+    tmpl = 0 if odd else min(1, src.page_count - 1)
     tmp = pymupdf.open()
     tmp.insert_pdf(src, from_page=tmpl, to_page=tmpl)
     if odd:
@@ -1086,13 +1092,13 @@ def _stamp_chrome(page: pymupdf.Page, src: pymupdf.Document, odd: bool, number: 
         )
     tmp[0].apply_redactions(images=0)
 
-    sy = HEADER_H / HEADER_SRC_H
+    sy = HEADER_H / header_src_h
     if odd:
-        left_src = pymupdf.Rect(0, 0, 147.4016, HEADER_SRC_H)
-        right_src = pymupdf.Rect(411.0236, 0, PAGE_W, HEADER_SRC_H)
+        left_src = pymupdf.Rect(0, 0, 147.4016, header_src_h)
+        right_src = pymupdf.Rect(411.0236, 0, PAGE_W, header_src_h)
     else:
-        left_src = pymupdf.Rect(0, 0, 184.2520, HEADER_SRC_H)
-        right_src = pymupdf.Rect(447.8740, 0, PAGE_W, HEADER_SRC_H)
+        left_src = pymupdf.Rect(0, 0, 184.2520, header_src_h)
+        right_src = pymupdf.Rect(447.8740, 0, PAGE_W, header_src_h)
     left_w = left_src.width * sy
     right_w = right_src.width * sy
     right_x0 = PAGE_W - right_w
@@ -1516,6 +1522,8 @@ def render_new_pages(
     src = pymupdf.open(catalog_src)
     price = pymupdf.open(price_src)
     out = pymupdf.open()
+    # v12 is the 2-page tall-header chrome; v13 already has the short header.
+    header_src_h = HEADER_SRC_H if src.page_count <= 2 else HEADER_H
 
     pages = place_pages(remaining_lines(lines), n_new)
     font_r = pymupdf.Font(fontfile=FONT_REG)
@@ -1527,7 +1535,7 @@ def render_new_pages(
         page_no = start_num + i
         odd = page_no % 2 == 1
         page = out.new_page(width=PAGE_W, height=PAGE_H)
-        _stamp_chrome(page, src, odd, f"{page_no:02d}")
+        _stamp_chrome(page, src, odd, f"{page_no:02d}", header_src_h)
 
         # category labels: merge consecutive same-category in a column
         for col in (0, 1):
@@ -1549,8 +1557,10 @@ def render_new_pages(
 
         for pl in placed_list:
             if pl.line.image_png:
-                img_cache[("xlsx", pl.line.excel_row)] = extract_image(price, pl.line)
-                png = img_cache[("xlsx", pl.line.excel_row)]
+                key = ("xlsx", pl.line.excel_source, pl.line.excel_row)
+                if key not in img_cache:
+                    img_cache[key] = extract_image(price, pl.line)
+                png = img_cache[key]
             else:
                 key = (pl.line.image_page, pl.line.image_xref)
                 if key not in img_cache:

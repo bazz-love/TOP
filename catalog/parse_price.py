@@ -22,7 +22,7 @@ _SKU_CYR_TO_LAT = str.maketrans(
 
 
 def latinize_sku(text: str) -> str:
-    return text.translate(_SKU_CYR_TO_LAT)
+    return text.translate(_SKU_CYR_TO_LAT).strip()
 
 
 # Card geometry — keep in sync with catalog.render (2×6 grid)
@@ -108,6 +108,8 @@ class ProductLine:
     image_page: int | None = None
     image_png: bytes | None = None
     excel_row: int | None = None
+    excel_source: str | None = None
+    excel_image: bytes | None = None
 
     @property
     def slots(self) -> int:
@@ -324,23 +326,44 @@ def _excel_images_by_row(xlsx_path: str | Path) -> dict[int, bytes]:
     return out
 
 
+def _excel_columns(ws) -> tuple[int, int, int]:
+    """Name / SKU / price columns. New 1C export: M/O/P; older file: F/N/O."""
+    name_c = sku_c = price_c = None
+    for r in range(1, 10):
+        for c in range(1, 17):
+            lab = str(ws.cell(r, c).value or "").strip().lower()
+            if lab in {"номенклатура", "наименование"}:
+                name_c = c
+            elif lab in {"код", "артикул"}:
+                sku_c = c
+            elif lab == "цена":
+                price_c = c
+    if name_c and sku_c and price_c:
+        return name_c, sku_c, price_c
+    return 6, 14, 15
+
+
 def parse_excel(xlsx_path: str | Path) -> list[ProductLine]:
     """Read the 1C Excel price: one product line per 12345 photo group."""
     from openpyxl import load_workbook
 
+    xlsx_path = Path(xlsx_path)
     wb = load_workbook(xlsx_path, data_only=True)
     ws = wb.active
+    name_c, sku_c, price_c = _excel_columns(ws)
+    images = _excel_images_by_row(xlsx_path)
     skip_sku = {"код", "kod", "sku", "артикул"}
     skip_name = {"номенклатура", "наименование"}
     lines: list[ProductLine] = []
     current: ProductLine | None = None
     current_cat = ("", "")
+    source = xlsx_path.name
     for r in range(1, (ws.max_row or 0) + 1):
         a = str(ws.cell(r, 1).value or "").strip()
-        name_raw = str(ws.cell(r, 6).value or "").strip()
-        sku_raw = str(ws.cell(r, 14).value or "").strip()
+        name_raw = str(ws.cell(r, name_c).value or "").strip()
+        sku_raw = str(ws.cell(r, sku_c).value or "").strip()
         sku = latinize_sku(sku_raw)
-        price_val = ws.cell(r, 15).value
+        price_val = ws.cell(r, price_c).value
         cat_m = CAT_RE.match(a)
         if cat_m:
             current_cat = (cat_m.group(1), cat_m.group(2).strip())
@@ -351,6 +374,8 @@ def parse_excel(xlsx_path: str | Path) -> list[ProductLine]:
                 category_code=current_cat[0],
                 category_name=current_cat[1],
                 excel_row=r,
+                excel_source=source,
+                excel_image=images.get(r),
             )
             lines.append(current)
         if not name_raw or not sku:
@@ -362,6 +387,8 @@ def parse_excel(xlsx_path: str | Path) -> list[ProductLine]:
                 category_code=current_cat[0],
                 category_name=current_cat[1],
                 excel_row=r,
+                excel_source=source,
+                excel_image=images.get(r),
             )
             lines.append(current)
         name = clean_name(name_raw, sku)
@@ -380,6 +407,13 @@ def parse_excel(xlsx_path: str | Path) -> list[ProductLine]:
                 if "«РОСОМАХА»" not in p.name:
                     p.name = (p.name + " «РОСОМАХА»").strip()
     return [ln for ln in lines if ln.products]
+
+
+def parse_excels(paths: list[str | Path]) -> list[ProductLine]:
+    lines: list[ProductLine] = []
+    for path in paths:
+        lines.extend(parse_excel(path))
+    return lines
 
 
 def attach_pdf_images(lines: list[ProductLine], pdf_path: str | Path) -> None:
@@ -402,20 +436,28 @@ def attach_pdf_images(lines: list[ProductLine], pdf_path: str | Path) -> None:
             p.image_xref = xref
 
 
-def apply_excel_photo_overrides(lines: list[ProductLine], xlsx_path: str | Path) -> None:
-    """One Excel photo: ROSOMAKHA cutting discs for metal and stainless."""
-    images = _excel_images_by_row(xlsx_path)
+# Groups that must use the Excel photo: previous metal-disc override plus
+# the three cards that visually changed in 1.xlsx.
+EXCEL_PHOTO_SKUS = {
+    "408125",  # отрезные по металлу и нерж. стали «РОСОМАХА»
+    "100125",  # алмазный универсальный «РОСОМАХА» (125 мм вместо 230)
+    "33269A",  # зубило SDS+
+    "031-211",  # лента шлифовальная ПРАКТИКА 100×610
+}
+
+
+def apply_excel_photo_overrides(lines: list[ProductLine], xlsx_path: str | Path | None = None) -> None:
+    """Excel photos for new cards (no PDF) and for the few visual replacements."""
+    extra: dict[int, bytes] = {}
+    if xlsx_path:
+        extra = _excel_images_by_row(xlsx_path)
     for ln in lines:
-        blob = " ".join(p.name for p in ln.products).lower()
-        if not (
-            "отрезн" in blob
-            and "нержавеющ" in blob
-            and "росомах" in blob
-        ):
+        blob = ln.excel_image or extra.get(ln.excel_row or -1)
+        if not blob:
             continue
-        png = images.get(ln.excel_row or -1)
-        if png:
-            ln.image_png = png
+        skus = {p.sku for p in ln.products}
+        if ln.image_xref is None or skus & EXCEL_PHOTO_SKUS:
+            ln.image_png = blob
 
 
 if __name__ == "__main__":
