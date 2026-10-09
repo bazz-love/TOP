@@ -240,6 +240,16 @@ def _sort_variants(products: list[Product]) -> list[Product]:
         vol = attrs.get("vol") or ()
         if vol:
             return (_num(vol[0]), 0.0, p.sku)
+        if attrs.get("tape"):
+            return (_num(attrs["tape"]), _num(attrs["tape"].split("×")[-1]), p.sku)
+        meters = attrs.get("meters") or ()
+        if meters:
+            return (_num(meters[0]), 0.0, p.sku)
+        if attrs.get("wrench"):
+            return (_num(attrs["wrench"]), 0.0, p.sku)
+        weight = attrs.get("weight") or ()
+        if weight:
+            return (_num(weight[0]), 0.0, p.sku)
         return (0.0, 0.0, p.sku)
 
     return sorted(products, key=dia_key)
@@ -269,6 +279,23 @@ VOL_RE = re.compile(
     r"(\d+(?:[.,]\d{1,2})?\s*(?:мл|л|гр\.?|г))(?!\w)",
     re.I,
 )
+# 5 м × 19 мм, 3м/16 мм, 3,0 м; 19 мм — length and tape width together.
+TAPE_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*м\s*[xх×*/;]\s*(\d+(?:[.,]\d+)?)\s*мм",
+    re.I,
+)
+CM_BOX_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?(?:\s*[×xх*]\s*\d+(?:[.,]\d+)?){1,3})\s*см\b",
+    re.I,
+)
+CM_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*см\b", re.I)
+# "1,5 м", but not the second letter of "мм" / "мл".
+METER_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*м(?![а-яёА-ЯЁa-zA-Z0-9/×xх])",
+    re.I,
+)
+KG_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*кг\b", re.I)
+ROLLER_W_RE = re.compile(r"\b(100|120|150|180|200|240|250|270|300)\b")
 THREAD_RE = re.compile(r"\b[МM]\s*14\b")
 THREAD_RANGE_RE = re.compile(r"[МM]\s*(\d+)\s*[-–]\s*[МM]?\s*(\d+)")
 INCH_RE = re.compile(
@@ -361,9 +388,50 @@ def _norm_measure(z: str) -> str:
     return z.strip()
 
 
+def _comma_num(token: str) -> str:
+    return token.replace(".", ",")
+
+
+def _is_level(name: str) -> bool:
+    n = name.lower()
+    return "уровен" in n and "лазер" not in n and "набор" not in n
+
+
+def _is_tape(name: str) -> bool:
+    n = name.lower()
+    return "рулет" in n or "лента мерн" in n or "лента геодез" in n
+
+
 def _split_core_and_attrs(name: str) -> tuple[str, dict]:
     s = PACK_RE.sub("", _normalize_name(name)).strip()
     attrs: dict = {}
+    tape_m = TAPE_RE.search(s)
+    if tape_m and _is_tape(name):
+        attrs["tape"] = (
+            f"{_comma_num(tape_m.group(1))} м × {_comma_num(tape_m.group(2))} мм"
+        )
+        s = TAPE_RE.sub(" ", s)
+    boxes: list[str] = []
+
+    def _keep_box(match: re.Match) -> str:
+        body = re.sub(r"\s*[xх*]\s*", "×", match.group(1))
+        boxes.append(f"{body} см")
+        return " "
+
+    s = CM_BOX_RE.sub(_keep_box, s)
+    cms = [f"{_comma_num(m.group(1))} см" for m in CM_RE.finditer(s)]
+    if boxes or cms:
+        attrs["sizes"] = tuple(boxes + cms)
+        s = CM_RE.sub(" ", s)
+    if not attrs.get("tape"):
+        meters = [f"{_comma_num(m.group(1))} м" for m in METER_RE.finditer(s)]
+        if meters:
+            attrs["meters"] = tuple(meters)
+            s = METER_RE.sub(" ", s)
+    weights = [f"{_comma_num(m.group(1))} кг" for m in KG_RE.finditer(s)]
+    if weights:
+        attrs["weight"] = tuple(weights)
+        s = KG_RE.sub(" ", s)
     mset = SET_COMMA_RE.search(s)
     if mset:
         attrs["set_dias"] = tuple(x.strip() for x in mset.group(1).split(",") if x.strip())
@@ -477,6 +545,33 @@ def _split_core_and_attrs(name: str) -> tuple[str, dict]:
     s = re.sub(r"\s*\*\s*", " ", s)
     s = re.sub(r"[\(\);,]+", " ", s)
     s = _strip_core_noise(s, name)
+    if re.search(r"валик|ролик", name, re.I) and not re.search(
+        r"бугел|удлинител", name, re.I
+    ):
+        widths = ROLLER_W_RE.findall(s)
+        if widths:
+            label = f"{widths[-1]} мм"
+            have = list(attrs.get("sizes") or ())
+            if label not in have:
+                attrs["sizes"] = tuple(have + [label])
+            s = re.sub(
+                rf"(валик|ролик)\s*{widths[-1]}\b",
+                r"\1",
+                s,
+                count=1,
+                flags=re.I,
+            )
+            s = re.sub(rf"\b{widths[-1]}\b", " ", s, count=1)
+    if (
+        re.search(r"ключ", name, re.I)
+        and "набор" not in name.lower()
+        and not attrs.get("sizes")
+        and not attrs.get("tape")
+    ):
+        wm = re.search(r"(\d{1,2}(?:[.,]\d+)?)\s*$", s)
+        if wm:
+            attrs["wrench"] = f"{_comma_num(wm.group(1))} мм"
+            s = s[: wm.start()]
     s = re.sub(r"\s+", " ", s).strip(" ,;.")
     return s, attrs
 
@@ -611,6 +706,10 @@ def _strip_bore_in_size(size: str) -> str:
     if not kept:
         return raw
     out = "×".join(kept)
+    if re.search(r"см$", out, flags=re.I):
+        return re.sub(r"(\d)\s*см$", r"\1 см", out, flags=re.I)
+    if re.search(r"(?<![мМmM])м$", out):
+        return re.sub(r"(\d)\s*м$", r"\1 м", out)
     if re.search(r"мм$", raw, flags=re.I) or "×" in out:
         if not re.search(r"мм$", out, flags=re.I):
             out += " мм"
@@ -622,13 +721,22 @@ def _size_parts_list(size: str) -> list[str]:
     return [p for p in body.split("×") if p]
 
 
+def _with_unit_space(text: str) -> str:
+    return re.sub(r"(\d)\s*(см|мм|м)$", r"\1 \2", text.strip(), flags=re.I)
+
+
 def _format_size_parts(parts: list[str]) -> str:
     if not parts:
         return ""
     if len(parts) == 1:
-        p = parts[0]
-        return p if re.search(r"мм", p, re.I) else f"{p} мм"
-    return "×".join(parts) + " мм"
+        p = _with_unit_space(parts[0])
+        if re.search(r"(?:см|мм|м)$", p, re.I):
+            return p
+        return f"{p} мм"
+    body = "×".join(parts)
+    if re.search(r"(?:см|мм|м)$", _with_unit_space(body), re.I):
+        return _with_unit_space(body)
+    return body + " мм"
 
 
 def _differing_size_label(mine_sizes: tuple[str, ...], size_vals: list) -> list[str]:
@@ -669,7 +777,7 @@ def _type_sizes(sizes: tuple[str, ...] | None) -> list[str]:
         num = float(m.group(1).replace(",", ".")) if m else 999
         if num < 2 and "×" not in s and not re.search(r"[-–]", s):
             continue
-        kept.append(_strip_bore_in_size(s))
+        kept.append(_with_unit_space(_strip_bore_in_size(s)))
     return kept or list(sizes)
 
 
@@ -826,8 +934,33 @@ def _arbor_bits(attrs: dict) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _level_length(attrs: dict) -> str | None:
+    """Tool length, not the 0,5 мм/м accuracy mark."""
+    cands: list[tuple[float, str]] = []
+    for s in attrs.get("sizes") or ():
+        low = s.lower()
+        n = _num(s)
+        if "см" in low and 15 <= n <= 400:
+            cands.append((n * 10, s))
+        elif "мм" in low and n >= 150:
+            cands.append((n, s))
+    for m in attrs.get("meters") or ():
+        cands.append((_num(m) * 1000, m))
+    if not cands:
+        return None
+    cands.sort(key=lambda item: item[0])
+    return cands[-1][1]
+
+
 def _spec_bits(attrs: dict, name: str = "") -> list[str]:
     bits: list[str] = []
+    if attrs.get("tape"):
+        return [attrs["tape"]]
+    if _is_level(name):
+        length = _level_length(attrs)
+        return [length] if length else []
+    if re.search(r"правил", name, re.I) and attrs.get("meters"):
+        return list(attrs["meters"])
     if attrs.get("set_dias"):
         bits.append(_format_dia_list(attrs["set_dias"]))
         return bits
@@ -894,6 +1027,10 @@ def _spec_bits(attrs: dict, name: str = "") -> list[str]:
         bits.extend(_arbor_bits(attrs))
     if not bits and attrs.get("thread"):
         bits.append(attrs["thread"])
+    bits.extend(attrs.get("meters") or ())
+    bits.extend(attrs.get("weight") or ())
+    if attrs.get("wrench") and attrs["wrench"] not in bits:
+        bits.append(attrs["wrench"])
     if not bits:
         bits.extend(attrs.get("count") or ())
     if attrs.get("L") and not bits:
@@ -908,8 +1045,156 @@ def _material_bit(name: str) -> str | None:
     return None
 
 
+def _fallback_type(name: str, title: str) -> str:
+    """A type taken from the name when no size/volume was found."""
+    low = name.lower()
+    bits: list[str] = []
+    if "полумаск" in low or "респиратор" in low:
+        if re.search(r"без\s+клапана", low):
+            bits.append("без клапана")
+        elif re.search(r"клапан", low):
+            bits.append("с клапаном")
+        elif "полумаск" in low:
+            bits.append("без клапана")
+        ffp = re.search(r"FFP\s*([123])", name, re.I)
+        if ffp:
+            bits.append(f"FFP{ffp.group(1)}")
+        if "угольн" in low:
+            bits.append("угольный слой")
+        for stem, label in (
+            ("формован", "формованная"),
+            ("складн", "складная"),
+            ("коническ", "коническая"),
+        ):
+            if stem in low:
+                bits.append(label)
+                break
+        for series in ("ПРОФИ", "МАСТЕР", "ЭКСПЕРТ", "СТАНДАРТ"):
+            if re.search(rf"(?<![A-Za-zА-Яа-яЁё]){series}(?![A-Za-zА-Яа-яЁё])", name, re.I):
+                bits.append(series)
+                break
+        for brand in ("3M", "У2К"):
+            if brand.lower() in low or brand in name:
+                bits.append(brand)
+                break
+        out: list[str] = []
+        for bit in bits:
+            if bit not in out:
+                out.append(bit)
+        if out:
+            return ", ".join(out)
+
+    for pat, label in (
+        (r"поликарбонат", "поликарбонат"),
+        (r"с\s+сеткой", "с сеткой"),
+        (r"для\s+косильщика", "для косильщика"),
+        (r"фибергласс|фиберглас", "фибергласс"),
+        (r"трехпозицион\w*", "трехпозиционная"),
+        (r"на\s+присоске", "на присоске"),
+        (r"панорамн\w*", "панорамные"),
+        (r"гелев\w+", "гелевые"),
+        (r"полиуретан", "полиуретан"),
+        (r"вспененн\w+\s+полиэтилен", "вспененный полиэтилен"),
+        (r"тефлон\w*", "тефлон"),
+        (r"анти-?\s*капля", "анти-капля"),
+        (r"полукорпусн\w*", "полукорпусной"),
+        (r"скелетн\w*", "скелетный"),
+        (r"цельнометаллическ\w*", "цельнометаллический"),
+        (r"треугольн\w*", "треугольный"),
+        (r"односторонн\w*", "одностороннее"),
+        (r"двухсторонн\w*", "двухсторонняя"),
+    ):
+        if re.search(pat, low):
+            bits.append(label)
+    for stem in ("желт", "прозрачн", "черн", "зелен", "синий", "син", "красн", "бел", "графит"):
+        m = re.search(rf"[A-Za-zА-Яа-яЁё]*{stem}[A-Za-zА-Яа-яЁё]*", low)
+        if m and m.group(0) not in bits:
+            bits.append(m.group(0))
+            break
+    if not bits:
+        for series in (
+            "ПРОФИ",
+            "МАСТЕР",
+            "ЭКСПЕРТ",
+            "ЭКОНОМ",
+            "СТАНДАРТ",
+            "ТЕФЛОН",
+            "ПЛАСТИК",
+        ):
+            if re.search(rf"(?<![A-Za-zА-Яа-яЁё]){series}(?![A-Za-zА-Яа-яЁё])", name, re.I):
+                bits.append(series)
+                break
+    if not bits:
+        span = re.search(r"\d+\s*[-–]\s*\d+", name)
+        if span:
+            bits.append(re.sub(r"\s+", "", span.group(0)))
+    if not bits:
+        combo = re.search(r"\d+\s*в\s*\d+", name, re.I)
+        if combo:
+            bits.append(re.sub(r"\s+", " ", combo.group(0)))
+    if not bits:
+        codes = re.findall(r"\b(?:T\d{3,}[A-Z]?|[A-Z]{2,}(?:-[A-Z0-9]+)+|У2К)\b", name)
+        if codes:
+            bits.append(codes[-1])
+    if not bits:
+        quoted = re.findall(r"[«\"]([^»\"]{2,28})[»\"]", name)
+        if quoted:
+            bits.append(quoted[-1].strip())
+    if not bits:
+        stop = {
+            "для", "по", "с", "и", "в", "на", "из", "от", "до", "мм", "см", "шт",
+            "уп", "tolsen", "blackhorn", "росомаха", "блистер", "набор", "emtops",
+            "emtop",
+        }
+        title_w = {_word_key(w) for w in title.split()}
+        extra = []
+        for w in re.findall(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-]{1,}", name):
+            key = _word_key(w)
+            if not key or key in title_w or key in stop or len(key) <= 1:
+                continue
+            if key.isdigit():
+                continue
+            extra.append(w)
+        bits.extend(extra[:3])
+    if not bits:
+        # Single cards repeat the name as the title; still name the variant.
+        stop = {
+            "для", "по", "с", "и", "в", "на", "из", "от", "до", "или", "мм", "см",
+            "шт", "tolsen", "blackhorn", "emtop",
+        }
+        words = [
+            w
+            for w in re.findall(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-]{2,}", name)
+            if _word_key(w) not in stop and not _word_key(w).isdigit()
+        ]
+        if words:
+            bits.append(words[-1])
+    out = []
+    for bit in bits:
+        if bit not in out:
+            out.append(bit)
+    return ", ".join(out[:4])
+
+
+def _join_type(bits: list[str], name: str, title: str) -> str:
+    cleaned = [b for b in bits if b]
+    if cleaned:
+        return ", ".join(cleaned)
+    return _fallback_type(name, title) or "—"
+
+
 def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
     mine_core, mine = _split_core_and_attrs_sku(p)
+    if mine.get("tape"):
+        return mine["tape"]
+    if _is_level(p.name):
+        length = _level_length(mine)
+        if length:
+            return length
+    if re.search(r"правил", p.name, re.I) and mine.get("meters"):
+        return ", ".join(mine["meters"])
+    if mine.get("wrench") and not mine.get("sizes"):
+        return mine["wrench"]
     if (
         _is_metal_drill(p.name)
         or _is_drill_set(p.name)
@@ -917,7 +1202,7 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
         or _is_spade_drill(p.name)
     ):
         bits = _spec_bits(mine, p.name)
-        return ", ".join(bits) if bits else "—"
+        return _join_type(bits, p.name, title)
     if len(siblings) == 1:
         bits = _spec_bits(mine, p.name)
         if not bits:
@@ -932,7 +1217,7 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
                     bits.append(
                         {"кондуктором": "кондуктор", "фрезой": "фреза"}[q.group(1).lower()]
                     )
-        return ", ".join(bits) if bits else "—"
+        return _join_type(bits, p.name, title)
 
     all_parsed = [_split_core_and_attrs_sku(s) for s in siblings]
     all_attrs = [a for _, a in all_parsed]
@@ -951,6 +1236,9 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
         "teeth",
         "inch",
         "adapter",
+        "meters",
+        "weight",
+        "wrench",
     ):
         vals = [a.get(key) for a in all_attrs]
         if len(set(vals)) > 1 and mine.get(key):
@@ -983,7 +1271,7 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
             mat = _material_bit(p.name)
             if mat:
                 bits.append(mat)
-    return ", ".join(bits) if bits else "—"
+    return _join_type(bits, p.name, title)
 
 
 # 1C omitted pack size for some SKUs; keep in sync with the matching tube/photo.

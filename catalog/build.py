@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build catalog pages from Excel parts 1 and 2."""
+"""Build catalog pages from Excel parts 1–6."""
 
 from pathlib import Path
 
@@ -11,7 +11,7 @@ from catalog.parse_price import (
 from catalog.render import remaining_lines, render_new_pages
 
 ROOT = Path(__file__).resolve().parents[1]
-EXCELS = [ROOT / "1.xlsx", ROOT / "2.xlsx"]
+EXCELS = [ROOT / f"{i}.xlsx" for i in range(1, 7)]
 PRICE = ROOT / "Прайс ТОП до ЛЕЗВИЙ.pdf"
 SRC = ROOT / "katalog_v12.pdf"
 if not SRC.exists():
