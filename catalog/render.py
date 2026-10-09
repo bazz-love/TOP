@@ -240,6 +240,16 @@ def _sort_variants(products: list[Product]) -> list[Product]:
         vol = attrs.get("vol") or ()
         if vol:
             return (_num(vol[0]), 0.0, p.sku)
+        if attrs.get("tape"):
+            return (_num(attrs["tape"]), _num(attrs["tape"].split("×")[-1]), p.sku)
+        meters = attrs.get("meters") or ()
+        if meters:
+            return (_num(meters[0]), 0.0, p.sku)
+        if attrs.get("wrench"):
+            return (_num(attrs["wrench"]), 0.0, p.sku)
+        weight = attrs.get("weight") or ()
+        if weight:
+            return (_num(weight[0]), 0.0, p.sku)
         return (0.0, 0.0, p.sku)
 
     return sorted(products, key=dia_key)
@@ -269,6 +279,44 @@ VOL_RE = re.compile(
     r"(\d+(?:[.,]\d{1,2})?\s*(?:мл|л|гр\.?|г))(?!\w)",
     re.I,
 )
+# 5 м × 19 мм, 3м/16 мм, 3,0 м; 19 мм — length and tape width together.
+TAPE_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*м\s*[xх×*/;]\s*(\d+(?:[.,]\d+)?)\s*мм",
+    re.I,
+)
+CM_BOX_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?(?:\s*[×xх*]\s*\d+(?:[.,]\d+)?){1,3})\s*см\b",
+    re.I,
+)
+CM_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*см\b", re.I)
+# "1,5 м", but not the second letter of "мм" / "мл".
+METER_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*м(?![а-яёА-ЯЁa-zA-Z0-9/×xх])",
+    re.I,
+)
+KG_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*кг\b", re.I)
+# Width may be glued to the word: «Валик180».
+ROLLER_W_RE = re.compile(
+    r"(?:(?<=валик)|(?<=ролик)|\b)(100|120|150|180|200|240|250|270|300)\b",
+    re.I,
+)
+PVC_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*мм\s*[xх×*]\s*(\d+(?:[.,]\d+)?)\s*м\b"
+    r"(?:\s*[xх×*]\s*(\d+(?:[.,]\d+)?)\s*мм)?",
+    re.I,
+)
+GLOVE_SIZE_RE = re.compile(
+    r"(?<![A-Za-zА-Яа-яЁё0-9])"
+    r"(XXXL|XXL|XL|XS|XXS|S|M|L|ХХХL|ХХL|ХL|ХS|М)"
+    r"(?![A-Za-zА-Яа-яЁё0-9])",
+    re.I,
+)
+CELL_RE = re.compile(r"(\d+)\s*яче\w*", re.I)
+COLOR_RE = re.compile(
+    r"\b(желт\w*|зелен\w*|красн\w*|син(?:ий|яя|ее|ие)?|черн\w*|бел\w*|"
+    r"сер\w*|оранжев\w*|коричнев\w*|фиолетов\w*|прозрачн\w*)\b",
+    re.I,
+)
 THREAD_RE = re.compile(r"\b[МM]\s*14\b")
 THREAD_RANGE_RE = re.compile(r"[МM]\s*(\d+)\s*[-–]\s*[МM]?\s*(\d+)")
 INCH_RE = re.compile(
@@ -279,7 +327,9 @@ INCH_RE = re.compile(
     r"|"
     r"\d+\s*/\s*\d+\s*[\"″]"
     r"|"
-    r"\d+\s*[\"″]"
+    # Not the thickness in «25×10"» — that quote closes the brush name.
+    # A digit lookbehind stops the match from eating only the last digit.
+    r"(?<![×xх*\d])\d+\s*[\"″]"
     r")"
 )
 SDS_PAIR_RE = re.compile(
@@ -361,9 +411,83 @@ def _norm_measure(z: str) -> str:
     return z.strip()
 
 
+def _comma_num(token: str) -> str:
+    return token.replace(".", ",")
+
+
+def _is_level(name: str) -> bool:
+    n = name.lower()
+    return "уровен" in n and "лазер" not in n and "набор" not in n
+
+
+def _is_tape(name: str) -> bool:
+    n = name.lower()
+    return "рулет" in n or "лента мерн" in n or "лента геодез" in n
+
+
+def _glove_token(token: str) -> str:
+    return (
+        token.upper()
+        .replace("Х", "X")
+        .replace("х", "X")
+        .replace("М", "M")
+        .replace("м", "M")
+    )
+
+
+def _color_word(name: str) -> str | None:
+    m = COLOR_RE.search(name)
+    return m.group(0).lower() if m else None
+
+
 def _split_core_and_attrs(name: str) -> tuple[str, dict]:
-    s = PACK_RE.sub("", _normalize_name(name)).strip()
+    src = name
     attrs: dict = {}
+    if _is_level(name):
+        # Accuracy (0,5 мм/м) is not the tool length.
+        src = re.sub(
+            r"(?:точн\.?\s*)?<\s*[\d.,/]+\s*мм\s*/\s*м",
+            " ",
+            src,
+            flags=re.I,
+        )
+        src = re.sub(r"точн\.?\s*[\d.,]+\s*мм\s*/\s*м", " ", src, flags=re.I)
+    if re.search(r"изолент", name, re.I):
+        pvc = PVC_RE.search(name)
+        if pvc:
+            spec = f"{_comma_num(pvc.group(1))} мм × {_comma_num(pvc.group(2))} м"
+            if pvc.group(3):
+                spec += f" × {_comma_num(pvc.group(3))} мм"
+            attrs["pvc"] = spec
+            src = name[: pvc.start()] + " " + name[pvc.end() :]
+    s = PACK_RE.sub("", _normalize_name(src)).strip()
+    tape_m = TAPE_RE.search(s)
+    if tape_m and _is_tape(name):
+        attrs["tape"] = (
+            f"{_comma_num(tape_m.group(1))} м × {_comma_num(tape_m.group(2))} мм"
+        )
+        s = TAPE_RE.sub(" ", s)
+    boxes: list[str] = []
+
+    def _keep_box(match: re.Match) -> str:
+        body = re.sub(r"\s*[xх*]\s*", "×", match.group(1))
+        boxes.append(f"{body} см")
+        return " "
+
+    s = CM_BOX_RE.sub(_keep_box, s)
+    cms = [f"{_comma_num(m.group(1))} см" for m in CM_RE.finditer(s)]
+    if boxes or cms:
+        attrs["sizes"] = tuple(boxes + cms)
+        s = CM_RE.sub(" ", s)
+    if not attrs.get("tape"):
+        meters = [f"{_comma_num(m.group(1))} м" for m in METER_RE.finditer(s)]
+        if meters:
+            attrs["meters"] = tuple(meters)
+            s = METER_RE.sub(" ", s)
+    weights = [f"{_comma_num(m.group(1))} кг" for m in KG_RE.finditer(s)]
+    if weights:
+        attrs["weight"] = tuple(weights)
+        s = KG_RE.sub(" ", s)
     mset = SET_COMMA_RE.search(s)
     if mset:
         attrs["set_dias"] = tuple(x.strip() for x in mset.group(1).split(",") if x.strip())
@@ -477,6 +601,49 @@ def _split_core_and_attrs(name: str) -> tuple[str, dict]:
     s = re.sub(r"\s*\*\s*", " ", s)
     s = re.sub(r"[\(\);,]+", " ", s)
     s = _strip_core_noise(s, name)
+    if re.search(r"валик|ролик", name, re.I) and not re.search(
+        r"бугел|удлинител", name, re.I
+    ):
+        widths = ROLLER_W_RE.findall(s)
+        if widths:
+            label = f"{widths[-1]} мм"
+            have = list(attrs.get("sizes") or ())
+            if label not in have:
+                attrs["sizes"] = tuple(have + [label])
+            s = re.sub(
+                rf"(валик|ролик)\s*{widths[-1]}\b",
+                r"\1",
+                s,
+                count=1,
+                flags=re.I,
+            )
+            s = re.sub(rf"\b{widths[-1]}\b", " ", s, count=1)
+            s = re.sub(
+                rf"(?<=валик){widths[-1]}\b|(?<=ролик){widths[-1]}\b",
+                "",
+                s,
+                count=1,
+                flags=re.I,
+            )
+    cells = CELL_RE.search(s)
+    if cells:
+        attrs["cells"] = re.sub(r"\s+", " ", cells.group(0)).strip()
+        s = CELL_RE.sub(" ", s)
+    if re.search(r"перчат", name, re.I):
+        gm = GLOVE_SIZE_RE.search(s)
+        if gm:
+            attrs["glove"] = _glove_token(gm.group(1))
+            s = s[: gm.start()] + " " + s[gm.end() :]
+    if (
+        re.search(r"ключ", name, re.I)
+        and "набор" not in name.lower()
+        and not attrs.get("sizes")
+        and not attrs.get("tape")
+    ):
+        wm = re.search(r"(\d{1,2}(?:[.,]\d+)?)\s*$", s)
+        if wm:
+            attrs["wrench"] = f"{_comma_num(wm.group(1))} мм"
+            s = s[: wm.start()]
     s = re.sub(r"\s+", " ", s).strip(" ,;.")
     return s, attrs
 
@@ -611,6 +778,10 @@ def _strip_bore_in_size(size: str) -> str:
     if not kept:
         return raw
     out = "×".join(kept)
+    if re.search(r"см$", out, flags=re.I):
+        return re.sub(r"(\d)\s*см$", r"\1 см", out, flags=re.I)
+    if re.search(r"(?<![мМmM])м$", out):
+        return re.sub(r"(\d)\s*м$", r"\1 м", out)
     if re.search(r"мм$", raw, flags=re.I) or "×" in out:
         if not re.search(r"мм$", out, flags=re.I):
             out += " мм"
@@ -622,13 +793,22 @@ def _size_parts_list(size: str) -> list[str]:
     return [p for p in body.split("×") if p]
 
 
+def _with_unit_space(text: str) -> str:
+    return re.sub(r"(\d)\s*(см|мм|м)$", r"\1 \2", text.strip(), flags=re.I)
+
+
 def _format_size_parts(parts: list[str]) -> str:
     if not parts:
         return ""
     if len(parts) == 1:
-        p = parts[0]
-        return p if re.search(r"мм", p, re.I) else f"{p} мм"
-    return "×".join(parts) + " мм"
+        p = _with_unit_space(parts[0])
+        if re.search(r"(?:см|мм|м)$", p, re.I):
+            return p
+        return f"{p} мм"
+    body = "×".join(parts)
+    if re.search(r"(?:см|мм|м)$", _with_unit_space(body), re.I):
+        return _with_unit_space(body)
+    return body + " мм"
 
 
 def _differing_size_label(mine_sizes: tuple[str, ...], size_vals: list) -> list[str]:
@@ -669,7 +849,7 @@ def _type_sizes(sizes: tuple[str, ...] | None) -> list[str]:
         num = float(m.group(1).replace(",", ".")) if m else 999
         if num < 2 and "×" not in s and not re.search(r"[-–]", s):
             continue
-        kept.append(_strip_bore_in_size(s))
+        kept.append(_with_unit_space(_strip_bore_in_size(s)))
     return kept or list(sizes)
 
 
@@ -826,8 +1006,35 @@ def _arbor_bits(attrs: dict) -> tuple[str, ...]:
     return tuple(out)
 
 
+def _level_length(attrs: dict) -> str | None:
+    """Tool length, not the 0,5 мм/м accuracy mark."""
+    cands: list[tuple[float, str]] = []
+    for s in attrs.get("sizes") or ():
+        low = s.lower()
+        n = _num(s)
+        if "см" in low and 15 <= n <= 400:
+            cands.append((n * 10, s))
+        elif "мм" in low and n >= 150:
+            cands.append((n, s))
+    for m in attrs.get("meters") or ():
+        cands.append((_num(m) * 1000, m))
+    if not cands:
+        return None
+    cands.sort(key=lambda item: item[0])
+    return cands[-1][1]
+
+
 def _spec_bits(attrs: dict, name: str = "") -> list[str]:
     bits: list[str] = []
+    if attrs.get("tape"):
+        return [attrs["tape"]]
+    if attrs.get("pvc"):
+        return [attrs["pvc"]]
+    if _is_level(name):
+        length = _level_length(attrs)
+        return [length] if length else []
+    if re.search(r"правил", name, re.I) and attrs.get("meters"):
+        return list(attrs["meters"])
     if attrs.get("set_dias"):
         bits.append(_format_dia_list(attrs["set_dias"]))
         return bits
@@ -894,6 +1101,10 @@ def _spec_bits(attrs: dict, name: str = "") -> list[str]:
         bits.extend(_arbor_bits(attrs))
     if not bits and attrs.get("thread"):
         bits.append(attrs["thread"])
+    bits.extend(attrs.get("meters") or ())
+    bits.extend(attrs.get("weight") or ())
+    if attrs.get("wrench") and attrs["wrench"] not in bits:
+        bits.append(attrs["wrench"])
     if not bits:
         bits.extend(attrs.get("count") or ())
     if attrs.get("L") and not bits:
@@ -908,8 +1119,163 @@ def _material_bit(name: str) -> str | None:
     return None
 
 
+def _fallback_type(name: str, title: str) -> str:
+    """A type taken from the name when no size/volume was found."""
+    low = name.lower()
+    bits: list[str] = []
+    if "полумаск" in low or "респиратор" in low:
+        if re.search(r"без\s+клапана", low):
+            bits.append("без клапана")
+        elif re.search(r"клапан", low):
+            bits.append("с клапаном")
+        elif "полумаск" in low:
+            bits.append("без клапана")
+        ffp = re.search(r"FFP\s*([123])", name, re.I)
+        if ffp:
+            bits.append(f"FFP{ffp.group(1)}")
+        if "угольн" in low:
+            bits.append("угольный слой")
+        for stem, label in (
+            ("формован", "формованная"),
+            ("складн", "складная"),
+            ("коническ", "коническая"),
+        ):
+            if stem in low:
+                bits.append(label)
+                break
+        for series in ("ПРОФИ", "МАСТЕР", "ЭКСПЕРТ", "СТАНДАРТ"):
+            if re.search(rf"(?<![A-Za-zА-Яа-яЁё]){series}(?![A-Za-zА-Яа-яЁё])", name, re.I):
+                bits.append(series)
+                break
+        for brand in ("3M", "У2К"):
+            if brand.lower() in low or brand in name:
+                bits.append(brand)
+                break
+        out: list[str] = []
+        for bit in bits:
+            if bit not in out:
+                out.append(bit)
+        if out:
+            return ", ".join(out)
+
+    for pat, label in (
+        (r"поликарбонат", "поликарбонат"),
+        (r"с\s+сеткой", "с сеткой"),
+        (r"для\s+косильщика", "для косильщика"),
+        (r"фибергласс|фиберглас", "фибергласс"),
+        (r"трехпозицион\w*", "трехпозиционная"),
+        (r"на\s+присоске", "на присоске"),
+        (r"панорамн\w*", "панорамные"),
+        (r"гелев\w+", "гелевые"),
+        (r"полиуретан", "полиуретан"),
+        (r"вспененн\w+\s+полиэтилен", "вспененный полиэтилен"),
+        (r"тефлон\w*", "тефлон"),
+        (r"анти-?\s*капля", "анти-капля"),
+        (r"полукорпусн\w*", "полукорпусной"),
+        (r"скелетн\w*", "скелетный"),
+        (r"цельнометаллическ\w*", "цельнометаллический"),
+        (r"треугольн\w*", "треугольный"),
+        (r"односторонн\w*", "одностороннее"),
+        (r"двухсторонн\w*", "двухсторонняя"),
+    ):
+        if re.search(pat, low):
+            bits.append(label)
+    for stem in ("желт", "прозрачн", "черн", "зелен", "синий", "син", "красн", "бел", "графит"):
+        m = re.search(rf"[A-Za-zА-Яа-яЁё]*{stem}[A-Za-zА-Яа-яЁё]*", low)
+        if m and m.group(0) not in bits:
+            bits.append(m.group(0))
+            break
+    if not bits:
+        for series in (
+            "ПРОФИ",
+            "МАСТЕР",
+            "ЭКСПЕРТ",
+            "ЭКОНОМ",
+            "СТАНДАРТ",
+            "ТЕФЛОН",
+            "ПЛАСТИК",
+        ):
+            if re.search(rf"(?<![A-Za-zА-Яа-яЁё]){series}(?![A-Za-zА-Яа-яЁё])", name, re.I):
+                bits.append(series)
+                break
+    if not bits:
+        span = re.search(r"\d+\s*[-–]\s*\d+", name)
+        if span:
+            bits.append(re.sub(r"\s+", "", span.group(0)))
+    if not bits:
+        combo = re.search(r"\d+\s*в\s*\d+", name, re.I)
+        if combo:
+            bits.append(re.sub(r"\s+", " ", combo.group(0)))
+    if not bits:
+        codes = re.findall(r"\b(?:T\d{3,}[A-Z]?|[A-Z]{2,}(?:-[A-Z0-9]+)+|У2К)\b", name)
+        if codes:
+            bits.append(codes[-1])
+    if not bits:
+        quoted = re.findall(r"[«\"]([^»\"]{2,28})[»\"]", name)
+        if quoted:
+            bits.append(quoted[-1].strip())
+    if not bits:
+        stop = {
+            "для", "по", "с", "и", "в", "на", "из", "от", "до", "мм", "см", "шт",
+            "уп", "tolsen", "blackhorn", "росомаха", "блистер", "набор", "emtops",
+            "emtop",
+        }
+        title_w = {_word_key(w) for w in title.split()}
+        extra = []
+        for w in re.findall(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-]{1,}", name):
+            key = _word_key(w)
+            if not key or key in title_w or key in stop or len(key) <= 1:
+                continue
+            if key.isdigit():
+                continue
+            extra.append(w)
+        bits.extend(extra[:3])
+    if not bits:
+        # Single cards repeat the name as the title; still name the variant.
+        stop = {
+            "для", "по", "с", "и", "в", "на", "из", "от", "до", "или", "мм", "см",
+            "шт", "tolsen", "blackhorn", "emtop",
+        }
+        words = [
+            w
+            for w in re.findall(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-]{2,}", name)
+            if _word_key(w) not in stop and not _word_key(w).isdigit()
+        ]
+        if words:
+            bits.append(words[-1])
+    out = []
+    for bit in bits:
+        if bit not in out:
+            out.append(bit)
+    return ", ".join(out[:4])
+
+
+def _join_type(bits: list[str], name: str, title: str) -> str:
+    cleaned = [b for b in bits if b]
+    if cleaned:
+        return ", ".join(cleaned)
+    return _fallback_type(name, title) or "—"
+
+
 def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
     mine_core, mine = _split_core_and_attrs_sku(p)
+    if mine.get("tape"):
+        return mine["tape"]
+    if mine.get("pvc"):
+        bits = [mine["pvc"]]
+        colors = [_color_word(s.name) for s in siblings]
+        color = _color_word(p.name)
+        if color and len({c for c in colors if c}) > 1:
+            bits.append(color)
+        return ", ".join(bits)
+    if _is_level(p.name):
+        length = _level_length(mine)
+        if length:
+            return length
+    if re.search(r"правил", p.name, re.I) and mine.get("meters"):
+        return ", ".join(mine["meters"])
+    if mine.get("wrench") and not mine.get("sizes"):
+        return mine["wrench"]
     if (
         _is_metal_drill(p.name)
         or _is_drill_set(p.name)
@@ -917,7 +1283,7 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
         or _is_spade_drill(p.name)
     ):
         bits = _spec_bits(mine, p.name)
-        return ", ".join(bits) if bits else "—"
+        return _join_type(bits, p.name, title)
     if len(siblings) == 1:
         bits = _spec_bits(mine, p.name)
         if not bits:
@@ -932,7 +1298,7 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
                     bits.append(
                         {"кондуктором": "кондуктор", "фрезой": "фреза"}[q.group(1).lower()]
                     )
-        return ", ".join(bits) if bits else "—"
+        return _join_type(bits, p.name, title)
 
     all_parsed = [_split_core_and_attrs_sku(s) for s in siblings]
     all_attrs = [a for _, a in all_parsed]
@@ -951,6 +1317,11 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
         "teeth",
         "inch",
         "adapter",
+        "meters",
+        "weight",
+        "wrench",
+        "cells",
+        "glove",
     ):
         vals = [a.get(key) for a in all_attrs]
         if len(set(vals)) > 1 and mine.get(key):
@@ -983,7 +1354,65 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
             mat = _material_bit(p.name)
             if mat:
                 bits.append(mat)
-    return ", ".join(bits) if bits else "—"
+    label = _join_type(bits, p.name, title)
+    glove = mine.get("glove")
+    if glove and glove not in label.split(", "):
+        label = f"{glove}, {label}" if label and label != "—" else glove
+    cells = mine.get("cells")
+    if cells and cells not in label:
+        label = f"{label}, {cells}" if label and label != "—" else cells
+    return label
+
+
+_DISAMBIG_NOISE = {
+    "индив",
+    "индивид",
+    "индивидуальная",
+    "упаковка",
+    "упаковке",
+    "уп",
+    "on",
+    "tolsen",
+    "blackhorn",
+    "блистер",
+    "росомаха",
+    "шт",
+}
+
+
+def _disambiguate_labels(
+    products: list[Product], title: str, labels: list[str]
+) -> list[str]:
+    """If two rows still share a type, append the words that actually differ."""
+    counts: dict[str, int] = {}
+    for lab in labels:
+        counts[lab] = counts.get(lab, 0) + 1
+    if all(n == 1 for n in counts.values()):
+        return labels
+    leftovers = []
+    for p in products:
+        core, _attrs = _split_core_and_attrs_sku(p)
+        leftovers.append(_leftover_words(core, title))
+    out: list[str] = []
+    for i, lab in enumerate(labels):
+        if counts[lab] == 1:
+            out.append(lab)
+            continue
+        others: set[str] = set()
+        for j, other in enumerate(labels):
+            if j != i and other == lab:
+                others.update(w.lower().strip(".,") for w in leftovers[j])
+        extra = []
+        for w in leftovers[i]:
+            key = w.lower().strip(".,#")
+            if key in others or key in _DISAMBIG_NOISE or key.isdigit() or len(key) <= 1:
+                continue
+            extra.append(w.strip(",."))
+        if extra:
+            out.append(f"{lab}, {', '.join(extra[:3])}")
+        else:
+            out.append(lab)
+    return out
 
 
 # 1C omitted pack size for some SKUs; keep in sync with the matching tube/photo.
@@ -1012,8 +1441,8 @@ def _draw_header_type(
     sy: float,
 ):
     """Title and quality captions at real metrics in the short header band."""
-    page.insert_font(fontname="segoe", fontfile=FONT_REG)
-    page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    page.insert_font(fontname="topreg", fontfile=FONT_REG)
+    page.insert_font(fontname="topbold", fontfile=FONT_BOLD)
     font_b = pymupdf.Font(fontfile=FONT_BOLD)
     font_r = pymupdf.Font(fontfile=FONT_REG)
     title_size = 13.5
@@ -1033,12 +1462,12 @@ def _draw_header_type(
     else:
         x = right_x0 - gap - cat_w - tov_w
         sub_x = x + cat_w + tov_w - sub_w
-    page.insert_text((x, title_y), cat, fontname="segoeb", fontsize=title_size, color=INK)
+    page.insert_text((x, title_y), cat, fontname="topbold", fontsize=title_size, color=INK)
     page.insert_text(
-        (x + cat_w, title_y), tov, fontname="segoeb", fontsize=title_size, color=ORANGE
+        (x + cat_w, title_y), tov, fontname="topbold", fontsize=title_size, color=ORANGE
     )
     page.insert_text(
-        (sub_x, sub_y), sub, fontname="segoe", fontsize=sub_size, color=SUBTITLE
+        (sub_x, sub_y), sub, fontname="topreg", fontsize=sub_size, color=SUBTITLE
     )
 
     cap_size = 6.0
@@ -1049,7 +1478,7 @@ def _draw_header_type(
             page.insert_text(
                 (tx, baseline),
                 text,
-                fontname="segoeb",
+                fontname="topbold",
                 fontsize=cap_size,
                 color=WHITE,
             )
@@ -1061,7 +1490,7 @@ def _draw_header_type(
             page.insert_text(
                 (right - tw, baseline),
                 text,
-                fontname="segoeb",
+                fontname="topbold",
                 fontsize=cap_size,
                 color=WHITE,
             )
@@ -1154,7 +1583,7 @@ def _stamp_chrome(
         fill=WHITE,
         width=0,
     )
-    page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    page.insert_font(fontname="topbold", fontfile=FONT_BOLD)
     _draw_header_type(page, odd, left_w, right_x0, sy)
     x, y = _PAGE_NUM_POS[odd]
     if odd:
@@ -1174,17 +1603,41 @@ def _stamp_chrome(
     page.insert_text(
         (x, y),
         number,
-        fontname="segoeb",
+        fontname="topbold",
         fontsize=16,
         color=WHITE,
     )
 
 
+# Card photos are a few centimetres on the page. JPEG keeps the PDF under GitHub's 100 MB limit.
+_JPEG_CACHE: dict[bytes, tuple[bytes, int, int]] = {}
+_CARD_PHOTO_PX = 480
+_CARD_JPEG_Q = 70
+
+
+def _card_jpeg(image_png: bytes) -> tuple[bytes, int, int]:
+    cached = _JPEG_CACHE.get(image_png)
+    if cached is not None:
+        return cached
+    im = Image.open(io.BytesIO(image_png)).convert("RGB")
+    w, h = im.size
+    scale = min(1.0, _CARD_PHOTO_PX / max(w, h, 1))
+    if scale < 1:
+        im = im.resize(
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=_CARD_JPEG_Q, optimize=True)
+    out = (buf.getvalue(), im.size[0], im.size[1])
+    _JPEG_CACHE[image_png] = out
+    return out
+
+
 def _place_image(page: pymupdf.Page, image_png: bytes | None, dest: pymupdf.Rect):
     if not image_png or dest.width < 8 or dest.height < 8:
         return
-    pix = pymupdf.Pixmap(image_png)
-    iw, ih = pix.width, pix.height
+    stream, iw, ih = _card_jpeg(image_png)
     if not iw or not ih:
         return
     scale = min(dest.width / iw, dest.height / ih)
@@ -1195,7 +1648,7 @@ def _place_image(page: pymupdf.Page, image_png: bytes | None, dest: pymupdf.Rect
         dest.x0 + (dest.width - dw) / 2 + dw,
         dest.y0 + (dest.height - dh) / 2 + dh,
     )
-    page.insert_image(box, pixmap=pix)
+    page.insert_image(box, stream=stream)
 
 
 HEAD_SIZE = 5.0
@@ -1228,7 +1681,7 @@ def _draw_text_row(
     page.insert_text(
         (name_x, y + 7.0),
         name,
-        fontname="segoe",
+        fontname="topreg",
         fontsize=name_size,
         color=INK,
     )
@@ -1238,7 +1691,7 @@ def _draw_text_row(
         page.insert_text(
             (sku_r - sku_w, y + 7.0),
             sku,
-            fontname="segoe",
+            fontname="topreg",
             fontsize=body,
             color=INK,
         )
@@ -1247,7 +1700,7 @@ def _draw_text_row(
         page.insert_text(
             (price_r - price_w, y + 7.0),
             price,
-            fontname="segoe",
+            fontname="topreg",
             fontsize=body,
             color=INK,
         )
@@ -1264,21 +1717,21 @@ def _draw_col_headers(
     page.insert_text(
         (name_x, y + HEAD_SIZE),
         "тип",
-        fontname="segoe",
+        fontname="topreg",
         fontsize=HEAD_SIZE,
         color=HEAD_INK,
     )
     page.insert_text(
         (sku_left, y + HEAD_SIZE),
         "код",
-        fontname="segoe",
+        fontname="topreg",
         fontsize=HEAD_SIZE,
         color=HEAD_INK,
     )
     page.insert_text(
         (price_left, y + HEAD_SIZE),
         "цена",
-        fontname="segoe",
+        fontname="topreg",
         fontsize=HEAD_SIZE,
         color=HEAD_INK,
     )
@@ -1290,7 +1743,7 @@ def _draw_title_band(
     rect: pymupdf.Rect,
     title: str,
 ) -> float:
-    page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    page.insert_font(fontname="topbold", fontfile=FONT_BOLD)
     lines = _wrap(font_b, title, TITLE_SIZE, rect.width - 16)[:2] or [title]
     band_h = 4.6 + 10.0 * len(lines)
     band = pymupdf.Rect(rect.x0 + 0.8, rect.y0 + 0.8, rect.x1 - 0.8, rect.y0 + band_h)
@@ -1306,7 +1759,7 @@ def _draw_title_band(
         page.insert_text(
             (rect.x0 + 7.0, y + TITLE_SIZE),
             tl,
-            fontname="segoeb",
+            fontname="topbold",
             fontsize=TITLE_SIZE,
             color=INK,
         )
@@ -1426,8 +1879,8 @@ def draw_card(
     font_r: pymupdf.Font,
     font_b: pymupdf.Font,
 ):
-    page.insert_font(fontname="segoe", fontfile=FONT_REG)
-    page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    page.insert_font(fontname="topreg", fontfile=FONT_REG)
+    page.insert_font(fontname="topbold", fontfile=FONT_BOLD)
     rect = _card_rect(placed.col, placed.row, placed.slots)
     page.draw_rect(rect, color=STROKE, fill=WHITE, width=0.65, radius=0.025)
 
@@ -1436,7 +1889,11 @@ def draw_card(
     if n >= 2:
         products = _sort_variants(products)
     title = _common_title(products)
-    labels = [_variant_label(p, products, title) for p in products]
+    labels = _disambiguate_labels(
+        products,
+        title,
+        [_variant_label(p, products, title) for p in products],
+    )
     row_h = 11.0
     pad_bottom = 4.0
     head_h = 7.5
@@ -1497,14 +1954,14 @@ def _draw_category_label(
         width=0.35,
         radius=0.09,
     )
-    page.insert_font(fontname="segoe", fontfile=FONT_REG)
+    page.insert_font(fontname="topreg", fontfile=FONT_REG)
     font = pymupdf.Font(fontfile=FONT_REG)
     size = 5.2
     tw = font.text_length(text, fontsize=size)
     page.insert_text(
         (_LABEL_INSERT_X[col], (y0 + y1) / 2 + tw / 2),
         text,
-        fontname="segoe",
+        fontname="topreg",
         fontsize=size,
         color=LABEL,
         rotate=90,
