@@ -443,6 +443,15 @@ def _color_word(name: str) -> str | None:
 def _split_core_and_attrs(name: str) -> tuple[str, dict]:
     src = name
     attrs: dict = {}
+    if _is_level(name):
+        # Accuracy (0,5 мм/м) is not the tool length.
+        src = re.sub(
+            r"(?:точн\.?\s*)?<\s*[\d.,/]+\s*мм\s*/\s*м",
+            " ",
+            src,
+            flags=re.I,
+        )
+        src = re.sub(r"точн\.?\s*[\d.,]+\s*мм\s*/\s*м", " ", src, flags=re.I)
     if re.search(r"изолент", name, re.I):
         pvc = PVC_RE.search(name)
         if pvc:
@@ -1600,11 +1609,35 @@ def _stamp_chrome(
     )
 
 
+# Card photos are a few centimetres on the page. JPEG keeps the PDF under GitHub's 100 MB limit.
+_JPEG_CACHE: dict[bytes, tuple[bytes, int, int]] = {}
+_CARD_PHOTO_PX = 480
+_CARD_JPEG_Q = 70
+
+
+def _card_jpeg(image_png: bytes) -> tuple[bytes, int, int]:
+    cached = _JPEG_CACHE.get(image_png)
+    if cached is not None:
+        return cached
+    im = Image.open(io.BytesIO(image_png)).convert("RGB")
+    w, h = im.size
+    scale = min(1.0, _CARD_PHOTO_PX / max(w, h, 1))
+    if scale < 1:
+        im = im.resize(
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=_CARD_JPEG_Q, optimize=True)
+    out = (buf.getvalue(), im.size[0], im.size[1])
+    _JPEG_CACHE[image_png] = out
+    return out
+
+
 def _place_image(page: pymupdf.Page, image_png: bytes | None, dest: pymupdf.Rect):
     if not image_png or dest.width < 8 or dest.height < 8:
         return
-    pix = pymupdf.Pixmap(image_png)
-    iw, ih = pix.width, pix.height
+    stream, iw, ih = _card_jpeg(image_png)
     if not iw or not ih:
         return
     scale = min(dest.width / iw, dest.height / ih)
@@ -1615,7 +1648,7 @@ def _place_image(page: pymupdf.Page, image_png: bytes | None, dest: pymupdf.Rect
         dest.x0 + (dest.width - dw) / 2 + dw,
         dest.y0 + (dest.height - dh) / 2 + dh,
     )
-    page.insert_image(box, pixmap=pix)
+    page.insert_image(box, stream=stream)
 
 
 HEAD_SIZE = 5.0
