@@ -295,7 +295,28 @@ METER_RE = re.compile(
     re.I,
 )
 KG_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*кг\b", re.I)
-ROLLER_W_RE = re.compile(r"\b(100|120|150|180|200|240|250|270|300)\b")
+# Width may be glued to the word: «Валик180».
+ROLLER_W_RE = re.compile(
+    r"(?:(?<=валик)|(?<=ролик)|\b)(100|120|150|180|200|240|250|270|300)\b",
+    re.I,
+)
+PVC_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*мм\s*[xх×*]\s*(\d+(?:[.,]\d+)?)\s*м\b"
+    r"(?:\s*[xх×*]\s*(\d+(?:[.,]\d+)?)\s*мм)?",
+    re.I,
+)
+GLOVE_SIZE_RE = re.compile(
+    r"(?<![A-Za-zА-Яа-яЁё0-9])"
+    r"(XXXL|XXL|XL|XS|XXS|S|M|L|ХХХL|ХХL|ХL|ХS|М)"
+    r"(?![A-Za-zА-Яа-яЁё0-9])",
+    re.I,
+)
+CELL_RE = re.compile(r"(\d+)\s*яче\w*", re.I)
+COLOR_RE = re.compile(
+    r"\b(желт\w*|зелен\w*|красн\w*|син(?:ий|яя|ее|ие)?|черн\w*|бел\w*|"
+    r"сер\w*|оранжев\w*|коричнев\w*|фиолетов\w*|прозрачн\w*)\b",
+    re.I,
+)
 THREAD_RE = re.compile(r"\b[МM]\s*14\b")
 THREAD_RANGE_RE = re.compile(r"[МM]\s*(\d+)\s*[-–]\s*[МM]?\s*(\d+)")
 INCH_RE = re.compile(
@@ -306,7 +327,9 @@ INCH_RE = re.compile(
     r"|"
     r"\d+\s*/\s*\d+\s*[\"″]"
     r"|"
-    r"\d+\s*[\"″]"
+    # Not the thickness in «25×10"» — that quote closes the brush name.
+    # A digit lookbehind stops the match from eating only the last digit.
+    r"(?<![×xх*\d])\d+\s*[\"″]"
     r")"
 )
 SDS_PAIR_RE = re.compile(
@@ -402,9 +425,33 @@ def _is_tape(name: str) -> bool:
     return "рулет" in n or "лента мерн" in n or "лента геодез" in n
 
 
+def _glove_token(token: str) -> str:
+    return (
+        token.upper()
+        .replace("Х", "X")
+        .replace("х", "X")
+        .replace("М", "M")
+        .replace("м", "M")
+    )
+
+
+def _color_word(name: str) -> str | None:
+    m = COLOR_RE.search(name)
+    return m.group(0).lower() if m else None
+
+
 def _split_core_and_attrs(name: str) -> tuple[str, dict]:
-    s = PACK_RE.sub("", _normalize_name(name)).strip()
+    src = name
     attrs: dict = {}
+    if re.search(r"изолент", name, re.I):
+        pvc = PVC_RE.search(name)
+        if pvc:
+            spec = f"{_comma_num(pvc.group(1))} мм × {_comma_num(pvc.group(2))} м"
+            if pvc.group(3):
+                spec += f" × {_comma_num(pvc.group(3))} мм"
+            attrs["pvc"] = spec
+            src = name[: pvc.start()] + " " + name[pvc.end() :]
+    s = PACK_RE.sub("", _normalize_name(src)).strip()
     tape_m = TAPE_RE.search(s)
     if tape_m and _is_tape(name):
         attrs["tape"] = (
@@ -562,6 +609,22 @@ def _split_core_and_attrs(name: str) -> tuple[str, dict]:
                 flags=re.I,
             )
             s = re.sub(rf"\b{widths[-1]}\b", " ", s, count=1)
+            s = re.sub(
+                rf"(?<=валик){widths[-1]}\b|(?<=ролик){widths[-1]}\b",
+                "",
+                s,
+                count=1,
+                flags=re.I,
+            )
+    cells = CELL_RE.search(s)
+    if cells:
+        attrs["cells"] = re.sub(r"\s+", " ", cells.group(0)).strip()
+        s = CELL_RE.sub(" ", s)
+    if re.search(r"перчат", name, re.I):
+        gm = GLOVE_SIZE_RE.search(s)
+        if gm:
+            attrs["glove"] = _glove_token(gm.group(1))
+            s = s[: gm.start()] + " " + s[gm.end() :]
     if (
         re.search(r"ключ", name, re.I)
         and "набор" not in name.lower()
@@ -956,6 +1019,8 @@ def _spec_bits(attrs: dict, name: str = "") -> list[str]:
     bits: list[str] = []
     if attrs.get("tape"):
         return [attrs["tape"]]
+    if attrs.get("pvc"):
+        return [attrs["pvc"]]
     if _is_level(name):
         length = _level_length(attrs)
         return [length] if length else []
@@ -1187,6 +1252,13 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
     mine_core, mine = _split_core_and_attrs_sku(p)
     if mine.get("tape"):
         return mine["tape"]
+    if mine.get("pvc"):
+        bits = [mine["pvc"]]
+        colors = [_color_word(s.name) for s in siblings]
+        color = _color_word(p.name)
+        if color and len({c for c in colors if c}) > 1:
+            bits.append(color)
+        return ", ".join(bits)
     if _is_level(p.name):
         length = _level_length(mine)
         if length:
@@ -1239,6 +1311,8 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
         "meters",
         "weight",
         "wrench",
+        "cells",
+        "glove",
     ):
         vals = [a.get(key) for a in all_attrs]
         if len(set(vals)) > 1 and mine.get(key):
@@ -1271,7 +1345,65 @@ def _variant_label(p: Product, siblings: list[Product], title: str) -> str:
             mat = _material_bit(p.name)
             if mat:
                 bits.append(mat)
-    return _join_type(bits, p.name, title)
+    label = _join_type(bits, p.name, title)
+    glove = mine.get("glove")
+    if glove and glove not in label.split(", "):
+        label = f"{glove}, {label}" if label and label != "—" else glove
+    cells = mine.get("cells")
+    if cells and cells not in label:
+        label = f"{label}, {cells}" if label and label != "—" else cells
+    return label
+
+
+_DISAMBIG_NOISE = {
+    "индив",
+    "индивид",
+    "индивидуальная",
+    "упаковка",
+    "упаковке",
+    "уп",
+    "on",
+    "tolsen",
+    "blackhorn",
+    "блистер",
+    "росомаха",
+    "шт",
+}
+
+
+def _disambiguate_labels(
+    products: list[Product], title: str, labels: list[str]
+) -> list[str]:
+    """If two rows still share a type, append the words that actually differ."""
+    counts: dict[str, int] = {}
+    for lab in labels:
+        counts[lab] = counts.get(lab, 0) + 1
+    if all(n == 1 for n in counts.values()):
+        return labels
+    leftovers = []
+    for p in products:
+        core, _attrs = _split_core_and_attrs_sku(p)
+        leftovers.append(_leftover_words(core, title))
+    out: list[str] = []
+    for i, lab in enumerate(labels):
+        if counts[lab] == 1:
+            out.append(lab)
+            continue
+        others: set[str] = set()
+        for j, other in enumerate(labels):
+            if j != i and other == lab:
+                others.update(w.lower().strip(".,") for w in leftovers[j])
+        extra = []
+        for w in leftovers[i]:
+            key = w.lower().strip(".,#")
+            if key in others or key in _DISAMBIG_NOISE or key.isdigit() or len(key) <= 1:
+                continue
+            extra.append(w.strip(",."))
+        if extra:
+            out.append(f"{lab}, {', '.join(extra[:3])}")
+        else:
+            out.append(lab)
+    return out
 
 
 # 1C omitted pack size for some SKUs; keep in sync with the matching tube/photo.
@@ -1300,8 +1432,8 @@ def _draw_header_type(
     sy: float,
 ):
     """Title and quality captions at real metrics in the short header band."""
-    page.insert_font(fontname="segoe", fontfile=FONT_REG)
-    page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    page.insert_font(fontname="topreg", fontfile=FONT_REG)
+    page.insert_font(fontname="topbold", fontfile=FONT_BOLD)
     font_b = pymupdf.Font(fontfile=FONT_BOLD)
     font_r = pymupdf.Font(fontfile=FONT_REG)
     title_size = 13.5
@@ -1321,12 +1453,12 @@ def _draw_header_type(
     else:
         x = right_x0 - gap - cat_w - tov_w
         sub_x = x + cat_w + tov_w - sub_w
-    page.insert_text((x, title_y), cat, fontname="segoeb", fontsize=title_size, color=INK)
+    page.insert_text((x, title_y), cat, fontname="topbold", fontsize=title_size, color=INK)
     page.insert_text(
-        (x + cat_w, title_y), tov, fontname="segoeb", fontsize=title_size, color=ORANGE
+        (x + cat_w, title_y), tov, fontname="topbold", fontsize=title_size, color=ORANGE
     )
     page.insert_text(
-        (sub_x, sub_y), sub, fontname="segoe", fontsize=sub_size, color=SUBTITLE
+        (sub_x, sub_y), sub, fontname="topreg", fontsize=sub_size, color=SUBTITLE
     )
 
     cap_size = 6.0
@@ -1337,7 +1469,7 @@ def _draw_header_type(
             page.insert_text(
                 (tx, baseline),
                 text,
-                fontname="segoeb",
+                fontname="topbold",
                 fontsize=cap_size,
                 color=WHITE,
             )
@@ -1349,7 +1481,7 @@ def _draw_header_type(
             page.insert_text(
                 (right - tw, baseline),
                 text,
-                fontname="segoeb",
+                fontname="topbold",
                 fontsize=cap_size,
                 color=WHITE,
             )
@@ -1442,7 +1574,7 @@ def _stamp_chrome(
         fill=WHITE,
         width=0,
     )
-    page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    page.insert_font(fontname="topbold", fontfile=FONT_BOLD)
     _draw_header_type(page, odd, left_w, right_x0, sy)
     x, y = _PAGE_NUM_POS[odd]
     if odd:
@@ -1462,7 +1594,7 @@ def _stamp_chrome(
     page.insert_text(
         (x, y),
         number,
-        fontname="segoeb",
+        fontname="topbold",
         fontsize=16,
         color=WHITE,
     )
@@ -1516,7 +1648,7 @@ def _draw_text_row(
     page.insert_text(
         (name_x, y + 7.0),
         name,
-        fontname="segoe",
+        fontname="topreg",
         fontsize=name_size,
         color=INK,
     )
@@ -1526,7 +1658,7 @@ def _draw_text_row(
         page.insert_text(
             (sku_r - sku_w, y + 7.0),
             sku,
-            fontname="segoe",
+            fontname="topreg",
             fontsize=body,
             color=INK,
         )
@@ -1535,7 +1667,7 @@ def _draw_text_row(
         page.insert_text(
             (price_r - price_w, y + 7.0),
             price,
-            fontname="segoe",
+            fontname="topreg",
             fontsize=body,
             color=INK,
         )
@@ -1552,21 +1684,21 @@ def _draw_col_headers(
     page.insert_text(
         (name_x, y + HEAD_SIZE),
         "тип",
-        fontname="segoe",
+        fontname="topreg",
         fontsize=HEAD_SIZE,
         color=HEAD_INK,
     )
     page.insert_text(
         (sku_left, y + HEAD_SIZE),
         "код",
-        fontname="segoe",
+        fontname="topreg",
         fontsize=HEAD_SIZE,
         color=HEAD_INK,
     )
     page.insert_text(
         (price_left, y + HEAD_SIZE),
         "цена",
-        fontname="segoe",
+        fontname="topreg",
         fontsize=HEAD_SIZE,
         color=HEAD_INK,
     )
@@ -1578,7 +1710,7 @@ def _draw_title_band(
     rect: pymupdf.Rect,
     title: str,
 ) -> float:
-    page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    page.insert_font(fontname="topbold", fontfile=FONT_BOLD)
     lines = _wrap(font_b, title, TITLE_SIZE, rect.width - 16)[:2] or [title]
     band_h = 4.6 + 10.0 * len(lines)
     band = pymupdf.Rect(rect.x0 + 0.8, rect.y0 + 0.8, rect.x1 - 0.8, rect.y0 + band_h)
@@ -1594,7 +1726,7 @@ def _draw_title_band(
         page.insert_text(
             (rect.x0 + 7.0, y + TITLE_SIZE),
             tl,
-            fontname="segoeb",
+            fontname="topbold",
             fontsize=TITLE_SIZE,
             color=INK,
         )
@@ -1714,8 +1846,8 @@ def draw_card(
     font_r: pymupdf.Font,
     font_b: pymupdf.Font,
 ):
-    page.insert_font(fontname="segoe", fontfile=FONT_REG)
-    page.insert_font(fontname="segoeb", fontfile=FONT_BOLD)
+    page.insert_font(fontname="topreg", fontfile=FONT_REG)
+    page.insert_font(fontname="topbold", fontfile=FONT_BOLD)
     rect = _card_rect(placed.col, placed.row, placed.slots)
     page.draw_rect(rect, color=STROKE, fill=WHITE, width=0.65, radius=0.025)
 
@@ -1724,7 +1856,11 @@ def draw_card(
     if n >= 2:
         products = _sort_variants(products)
     title = _common_title(products)
-    labels = [_variant_label(p, products, title) for p in products]
+    labels = _disambiguate_labels(
+        products,
+        title,
+        [_variant_label(p, products, title) for p in products],
+    )
     row_h = 11.0
     pad_bottom = 4.0
     head_h = 7.5
@@ -1785,14 +1921,14 @@ def _draw_category_label(
         width=0.35,
         radius=0.09,
     )
-    page.insert_font(fontname="segoe", fontfile=FONT_REG)
+    page.insert_font(fontname="topreg", fontfile=FONT_REG)
     font = pymupdf.Font(fontfile=FONT_REG)
     size = 5.2
     tw = font.text_length(text, fontsize=size)
     page.insert_text(
         (_LABEL_INSERT_X[col], (y0 + y1) / 2 + tw / 2),
         text,
-        fontname="segoe",
+        fontname="topreg",
         fontsize=size,
         color=LABEL,
         rotate=90,
